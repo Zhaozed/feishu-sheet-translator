@@ -38,6 +38,7 @@ const aiClient = aiApiKey
 
 const processedMessageIds = new Set();
 const pendingConfirmations = new Map();
+const pendingFullTableTranslations = new Map();
 const MAX_COLUMNS_RANGE = "CV";
 const HEADER_SCAN_ROW_COUNT = 20;
 const TRANSLATION_CONCURRENCY = 4;
@@ -149,6 +150,24 @@ async function replyToMessage(messageId, text) {
   });
 }
 
+function buildModeSelectionCard() {
+  return buildMessageCard(
+    "请选择翻译模式",
+    [
+      "**补充现有语言**\n新增了一行或几行中文，补齐表格中已经存在的全部目标语言。",
+      "",
+      "**新增语种并全表翻译**\n在表格末尾追加一个新语言列，并把全部有效简体中文翻译后回填。",
+    ].join("\n"),
+    {
+      template: "blue",
+      buttons: [
+        { name: "open_existing_translation", text: "补充现有语言", type: "primary" },
+        { name: "open_new_locale_translation", text: "新增语种并全表翻译" },
+      ],
+    },
+  );
+}
+
 function buildTranslationFormCard() {
   return {
     config: {
@@ -159,7 +178,7 @@ function buildTranslationFormCard() {
       template: "blue",
       title: {
         tag: "plain_text",
-        content: "发起表格翻译",
+        content: "补充现有语言",
       },
     },
     elements: [
@@ -246,8 +265,8 @@ function buildTranslationFormCard() {
           {
             tag: "button",
             type: "default",
-            text: { tag: "plain_text", content: "添加新语种" },
-            value: { action: "open_add_language" },
+            text: { tag: "plain_text", content: "返回模式选择" },
+            value: { action: "open_mode_selection" },
           },
         ],
       },
@@ -255,18 +274,18 @@ function buildTranslationFormCard() {
   };
 }
 
-function buildAddLanguageFormCard() {
+function buildNewLocaleTranslationFormCard() {
   return {
     config: { wide_screen_mode: true, update_multi: false },
     header: {
       template: "purple",
-      title: { tag: "plain_text", content: "添加新语种" },
+      title: { tag: "plain_text", content: "新增语种并全表翻译" },
     },
     elements: [
       {
         tag: "markdown",
         content:
-          "机器人会读取目标表的现有语言表头，并自动沿用其风格。\n- 标签风格示例：`Arabic(语言标签ar)`\n- 纯名称风格示例：`简体中文、意大利语`",
+          "机器人会自动识别表头风格，在最后追加新语言列，并翻译该表全部有效的简体中文行。提交后会先展示任务规模，确认后才执行。",
       },
       {
         tag: "form",
@@ -300,11 +319,11 @@ function buildAddLanguageFormCard() {
           },
           {
             tag: "button",
-            name: "submit_add_language",
+            name: "submit_new_locale_translation",
             action_type: "form_submit",
             type: "primary",
-            text: { tag: "plain_text", content: "确认添加" },
-            value: { action: "submit_add_language" },
+            text: { tag: "plain_text", content: "检查全表任务" },
+            value: { action: "submit_new_locale_translation" },
           },
         ],
       },
@@ -313,7 +332,7 @@ function buildAddLanguageFormCard() {
         elements: [
           {
             tag: "plain_text",
-            content: "只新增语言列，不会立即翻译已有行。添加后可返回翻译卡片发起任务。",
+            content: "任务会跳过简体中文为空的行；不会改动现有语言列。",
           },
         ],
       },
@@ -325,8 +344,12 @@ async function replyWithTranslationForm(messageId) {
   await replyWithCard(messageId, buildTranslationFormCard());
 }
 
-async function replyWithAddLanguageForm(messageId) {
-  await replyWithCard(messageId, buildAddLanguageFormCard());
+async function replyWithModeSelection(messageId) {
+  await replyWithCard(messageId, buildModeSelectionCard());
+}
+
+async function replyWithNewLocaleTranslationForm(messageId) {
+  await replyWithCard(messageId, buildNewLocaleTranslationFormCard());
 }
 
 async function replyWithCard(messageId, card) {
@@ -389,7 +412,14 @@ async function replyWithPermissionCard(messageId, command, error) {
   if (sheetUrl) {
     buttons.push({ text: "打开表格并授权", url: sheetUrl, type: "primary" });
   }
-  buttons.push({ name: "reopen_form", text: "授权后重新发起" });
+  buttons.push({
+    name: command?.startRow
+      ? "open_existing_translation"
+      : command
+        ? "open_new_locale_translation"
+        : "open_mode_selection",
+    text: "授权后重新发起",
+  });
   await replyWithCard(
     messageId,
     buildMessageCard(
@@ -424,7 +454,15 @@ async function replyWithErrorCard(messageId, error, command) {
       {
         template: "red",
         buttons: [
-          { name: "reopen_form", text: "重新填写", type: "primary" },
+          {
+            name: command?.startRow
+              ? "open_existing_translation"
+              : command
+                ? "open_new_locale_translation"
+                : "open_mode_selection",
+            text: "重新填写",
+            type: "primary",
+          },
         ],
       },
     ),
@@ -625,6 +663,13 @@ function getLanguageTag(header) {
   )?.tag;
 }
 
+function getLanguageDisplayName(header, fallbackTag = "") {
+  const displayName = normalizeCell(header)
+    .replace(/\(语言标签\s*[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*\)/i, "")
+    .trim();
+  return displayName || fallbackTag;
+}
+
 function findHeaderRow(rows) {
   for (let index = 0; index < rows.length; index += 1) {
     const headers = rows[index] ?? [];
@@ -784,13 +829,22 @@ async function mapWithConcurrency(items, limit, mapper) {
   return results;
 }
 
-async function translateText(sourceText, languageTag, rowContext = "") {
+async function translateText(
+  sourceText,
+  languageTag,
+  rowContext = "",
+  languageNameOverride = "",
+) {
   const normalizedTag = languageTag.toLowerCase();
   const customLanguage = customLanguageRegistry.find(
     (item) => item.tag?.toLowerCase() === normalizedTag,
   );
   const languageName =
-    customLanguage?.modelLanguage ?? customLanguage?.name ?? LANGUAGE_NAMES[normalizedTag] ?? languageTag;
+    languageNameOverride ||
+    (customLanguage?.modelLanguage ??
+      customLanguage?.name ??
+      LANGUAGE_NAMES[normalizedTag] ??
+      languageTag);
   const response = await aiClient.chat.completions.create({
     model: aiModel,
     messages: [
@@ -1022,6 +1076,7 @@ async function executeTranslationCommand(
             job.analysis.sourceText,
             job.target.tag,
             job.rowContext,
+            getLanguageDisplayName(job.target.header, job.target.tag),
           ),
         };
       } catch (error) {
@@ -1119,7 +1174,34 @@ function inferLanguageHeaderStyle(headers) {
     : "plain";
 }
 
-async function addLanguageToSheet(messageId, spreadsheetCommand, languageName, languageTag) {
+async function readRowsInChunks(
+  spreadsheetToken,
+  sheetId,
+  startRow,
+  endRow,
+  startColumn = "A",
+  endColumn = MAX_COLUMNS_RANGE,
+  chunkSize = 200,
+) {
+  const rows = [];
+  for (let chunkStart = startRow; chunkStart <= endRow; chunkStart += chunkSize) {
+    const chunkEnd = Math.min(endRow, chunkStart + chunkSize - 1);
+    const values = await readRange(
+      spreadsheetToken,
+      `${sheetId}!${startColumn}${chunkStart}:${endColumn}${chunkEnd}`,
+    );
+    for (let index = 0; index <= chunkEnd - chunkStart; index += 1) {
+      rows.push(values[index] ?? []);
+    }
+  }
+  return rows;
+}
+
+async function prepareFullTableTranslation(
+  spreadsheetCommand,
+  languageName,
+  languageTag,
+) {
   const spreadsheetToken = await resolveSpreadsheetToken(
     spreadsheetCommand.resourceType,
     spreadsheetCommand.resourceToken,
@@ -1134,6 +1216,12 @@ async function addLanguageToSheet(messageId, spreadsheetCommand, languageName, l
     `${sheetId}!A1:${MAX_COLUMNS_RANGE}${HEADER_SCAN_ROW_COUNT}`,
   );
   const { headerRowNumber, headers } = findHeaderRow(headerRows);
+  const sourceColumn = headers.findIndex(
+    (header) => getLanguageTag(header)?.toLowerCase() === "zh-hans",
+  );
+  if (sourceColumn < 0) {
+    throw new Error("没有找到简体中文源语言列。");
+  }
   const normalizedTag = languageTag.toLowerCase();
   if (
     headers.some(
@@ -1166,12 +1254,83 @@ async function addLanguageToSheet(messageId, spreadsheetCommand, languageName, l
     throw new Error("当前表头已到 CV 列，机器人暂时无法继续向右新增语言列。");
   }
   const column = columnIndexToLetters(newColumnIndex);
-  await writeRangesInChunks(spreadsheetToken, [
-    {
-      range: `${sheetId}!${column}${headerRowNumber}:${column}${headerRowNumber}`,
-      values: [[newHeader]],
-    },
-  ]);
+  const configuredRowCount =
+    sheet.grid_properties?.row_count ?? sheet.row_count ?? 5000;
+  const maxRow = Math.min(Math.max(configuredRowCount, headerRowNumber + 1), 20000);
+  const sourceColumnLetters = columnIndexToLetters(sourceColumn);
+  const sourceRows = await readRowsInChunks(
+    spreadsheetToken,
+    sheetId,
+    headerRowNumber + 1,
+    maxRow,
+    sourceColumnLetters,
+    sourceColumnLetters,
+    500,
+  );
+  const validRowNumbers = [];
+  sourceRows.forEach((row, index) => {
+    if (normalizeCell(row[0])) {
+      validRowNumbers.push(headerRowNumber + 1 + index);
+    }
+  });
+  if (validRowNumbers.length === 0) {
+    throw new Error("简体中文列没有任何可翻译内容，无法创建全表翻译任务。");
+  }
+  return {
+    spreadsheetCommand,
+    spreadsheetToken,
+    sheet,
+    sheetId,
+    headerRowNumber,
+    headers,
+    sourceColumn,
+    style,
+    newHeader,
+    newColumnIndex,
+    column,
+    languageName,
+    languageTag,
+    validRowNumbers,
+    lastDataRow: validRowNumbers.at(-1),
+  };
+}
+
+async function showFullTableTranslationPreview(messageId, actorKey, task) {
+  pendingFullTableTranslations.set(actorKey, {
+    spreadsheetCommand: task.spreadsheetCommand,
+    languageName: task.languageName,
+    languageTag: task.languageTag,
+    expiresAt: Date.now() + CONFIRMATION_TTL_MS,
+  });
+  await replyWithCard(
+    messageId,
+    buildMessageCard(
+      "确认新增语种全表翻译",
+      [
+        `工作表：${task.sheet.title ?? task.sheetId}`,
+        `表头：第${task.headerRowNumber}行`,
+        `识别到的表头风格：${task.style === "tagged" ? "名称 + 语言标签" : "纯语言名称"}`,
+        `将在 ${task.column} 列新增：**${task.newHeader}**`,
+        `有效简体中文：**${task.validRowNumbers.length}行**`,
+        `预计翻译并回填：**${task.validRowNumbers.length}个单元格**`,
+        "",
+        "确认后才会调用模型并写入表格；现有语言列不会被修改。",
+        "该确认将在 10 分钟后失效。",
+      ].join("\n"),
+      {
+        template: "orange",
+        buttons: [
+          { name: "confirm_full_table_translation", text: "确认并开始", type: "primary" },
+          { name: "cancel_full_table_translation", text: "取消" },
+          { text: "打开当前表格", url: task.spreadsheetCommand.originalUrl },
+        ],
+      },
+    ),
+  );
+}
+
+async function registerCustomLanguage(languageName, languageTag) {
+  const normalizedTag = languageTag.toLowerCase();
 
   const existingLanguage = customLanguageRegistry.find(
     (item) => item.tag?.toLowerCase() === normalizedTag,
@@ -1191,25 +1350,125 @@ async function addLanguageToSheet(messageId, spreadsheetCommand, languageName, l
     });
   }
   await saveLanguageRegistry();
+}
+
+async function executeFullTableTranslation(messageId, taskInput) {
+  if (!aiClient) {
+    throw new Error("尚未配置 AI_API_KEY，无法执行翻译。");
+  }
+  const task = await prepareFullTableTranslation(
+    taskInput.spreadsheetCommand,
+    taskInput.languageName,
+    taskInput.languageTag,
+  );
+  await replyWithCard(
+    messageId,
+    buildMessageCard(
+      "正在执行全表翻译",
+      [
+        `工作表：${task.sheet.title ?? task.sheetId}`,
+        `新增语言：${task.newHeader}`,
+        `待翻译：${task.validRowNumbers.length}行`,
+        "",
+        "⏳ 正在读取上下文、生成译文并检查源内容，请稍候……",
+      ].join("\n"),
+      { template: "blue" },
+    ),
+  );
+
+  const allRows = await readRowsInChunks(
+    task.spreadsheetToken,
+    task.sheetId,
+    task.headerRowNumber + 1,
+    task.lastDataRow,
+  );
+  const jobs = task.validRowNumbers.map((rowNumber) => {
+    const row = allRows[rowNumber - task.headerRowNumber - 1] ?? [];
+    return {
+      rowNumber,
+      sourceText: normalizeCell(row[task.sourceColumn]),
+      rowContext: buildRowContext(task.headers, row),
+    };
+  });
+  const results = await mapWithConcurrency(
+    jobs,
+    TRANSLATION_CONCURRENCY,
+    async (job) => {
+      try {
+        return {
+          job,
+          translation: await translateText(
+            job.sourceText,
+            task.languageTag,
+            job.rowContext,
+            task.languageName,
+          ),
+        };
+      } catch (error) {
+        return {
+          job,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    },
+  );
+
+  const sourceColumnLetters = columnIndexToLetters(task.sourceColumn);
+  const latestSources = await readRowsInChunks(
+    task.spreadsheetToken,
+    task.sheetId,
+    task.headerRowNumber + 1,
+    task.lastDataRow,
+    sourceColumnLetters,
+    sourceColumnLetters,
+    500,
+  );
+  const conflicts = new Set();
+  for (const job of jobs) {
+    const latest = normalizeCell(
+      latestSources[job.rowNumber - task.headerRowNumber - 1]?.[0],
+    );
+    if (latest !== job.sourceText) {
+      conflicts.add(job.rowNumber);
+    }
+  }
+  const successes = results.filter(
+    (result) => result.translation && !conflicts.has(result.job.rowNumber),
+  );
+  const failures = results.filter((result) => result.error);
+  const valueRanges = [
+    {
+      range: `${task.sheetId}!${task.column}${task.headerRowNumber}:${task.column}${task.headerRowNumber}`,
+      values: [[task.newHeader]],
+    },
+    ...successes.map((result) => ({
+      range: `${task.sheetId}!${task.column}${result.job.rowNumber}:${task.column}${result.job.rowNumber}`,
+      values: [[result.translation]],
+    })),
+  ];
+  await writeRangesInChunks(task.spreadsheetToken, valueRanges);
+  await registerCustomLanguage(task.languageName, task.languageTag);
 
   await replyWithCard(
     messageId,
     buildMessageCard(
-      "新语种已添加",
+      failures.length > 0 || conflicts.size > 0
+        ? "新增语种翻译部分完成"
+        : "新增语种翻译完成",
       [
-        `工作表：${sheet.title ?? sheetId}`,
-        `表头位置：${column}${headerRowNumber}`,
-        `识别到的表头风格：${style === "tagged" ? "名称 + 语言标签" : "纯语言名称"}`,
-        `新增表头：**${newHeader}**`,
+        `工作表：${task.sheet.title ?? task.sheetId}`,
+        `新增表头：**${task.newHeader}**`,
+        `成功回填：${successes.length}行`,
+        `翻译失败：${failures.length}行`,
+        `源内容变化跳过：${conflicts.size}行`,
         "",
-        "该语言已写入机器人语言注册表，后续重启也能继续识别。",
+        `[打开当前表格](${task.spreadsheetCommand.originalUrl})`,
       ].join("\n"),
       {
-        template: "green",
+        template: failures.length > 0 || conflicts.size > 0 ? "orange" : "green",
         buttons: [
-          { text: "打开当前表格", url: spreadsheetCommand.originalUrl, type: "primary" },
-          { name: "reopen_form", text: "开始翻译" },
-          { name: "open_add_language", text: "继续添加语种" },
+          { text: "打开当前表格", url: task.spreadsheetCommand.originalUrl, type: "primary" },
+          { name: "open_mode_selection", text: "返回模式选择" },
         ],
       },
     ),
@@ -1218,11 +1477,11 @@ async function addLanguageToSheet(messageId, spreadsheetCommand, languageName, l
 
 async function handleTextMessage(messageId, actorKey, text) {
   if (/添加.*(?:语种|语言)|新增.*(?:语种|语言)/i.test(text)) {
-    await replyWithAddLanguageForm(messageId);
+    await replyWithNewLocaleTranslationForm(messageId);
     return;
   }
   if (/^(hi|hello|你好|您好)$/i.test(text)) {
-    await replyWithTranslationForm(messageId);
+    await replyWithModeSelection(messageId);
     return;
   }
 
@@ -1264,7 +1523,7 @@ async function handleTextMessage(messageId, actorKey, text) {
   }
 
   if (!command) {
-    await replyWithTranslationForm(messageId);
+    await replyWithModeSelection(messageId);
     return;
   }
 
@@ -1294,12 +1553,22 @@ async function handleCardAction(data) {
     return;
   }
 
-  if (actionName === "open_add_language") {
-    await replyWithAddLanguageForm(messageId);
+  if (actionName === "open_mode_selection") {
+    await replyWithModeSelection(messageId);
     return;
   }
 
-  if (actionName === "submit_add_language") {
+  if (actionName === "open_existing_translation") {
+    await replyWithTranslationForm(messageId);
+    return;
+  }
+
+  if (actionName === "open_new_locale_translation") {
+    await replyWithNewLocaleTranslationForm(messageId);
+    return;
+  }
+
+  if (actionName === "submit_new_locale_translation") {
     const values = getCardFormValues(action);
     const sheetUrl = normalizeCell(values.sheet_url);
     const languageName = normalizeCell(values.language_name);
@@ -1313,15 +1582,45 @@ async function handleCardAction(data) {
         throw new Error("语言标签不符合 BCP 47 格式，例如 th、fr-CA 或 zh-Hant。");
       }
       spreadsheetCommand = parseSpreadsheetUrl(sheetUrl);
-      await addLanguageToSheet(
-        messageId,
+      const task = await prepareFullTableTranslation(
         spreadsheetCommand,
         languageName,
         languageTag,
       );
+      await showFullTableTranslationPreview(messageId, actorKey, task);
     } catch (error) {
-      console.error("[添加语种失败]", formatFeishuError(error));
+      console.error("[新增语种预检失败]", formatFeishuError(error));
       await replyWithErrorCard(messageId, error, spreadsheetCommand);
+    }
+    return;
+  }
+
+  if (
+    actionName === "confirm_full_table_translation" ||
+    actionName === "cancel_full_table_translation"
+  ) {
+    const pending = pendingFullTableTranslations.get(actorKey);
+    if (!pending || pending.expiresAt < Date.now()) {
+      pendingFullTableTranslations.delete(actorKey);
+      await replyWithErrorCard(messageId, "全表翻译确认已失效，请重新发起任务。");
+      return;
+    }
+    pendingFullTableTranslations.delete(actorKey);
+    if (actionName === "cancel_full_table_translation") {
+      await replyWithCard(
+        messageId,
+        buildMessageCard("已取消", "未新增语言列，也没有修改表格。", {
+          template: "grey",
+          buttons: [{ name: "open_mode_selection", text: "返回模式选择", type: "primary" }],
+        }),
+      );
+      return;
+    }
+    try {
+      await executeFullTableTranslation(messageId, pending);
+    } catch (error) {
+      console.error("[新增语种全表翻译失败]", formatFeishuError(error));
+      await replyWithErrorCard(messageId, error, pending.spreadsheetCommand);
     }
     return;
   }
@@ -1409,8 +1708,10 @@ const eventDispatcher = new Lark.EventDispatcher({}).register({
         content:
           actionName === "submit_translation"
             ? "已提交，正在读取表格……"
-            : actionName === "submit_add_language"
-              ? "已提交，正在检查表头风格……"
+            : actionName === "submit_new_locale_translation"
+              ? "已提交，正在扫描全表……"
+              : actionName === "confirm_full_table_translation"
+                ? "已确认，正在开始全表翻译……"
             : "操作已提交",
       },
     };
@@ -1431,7 +1732,7 @@ const eventDispatcher = new Lark.EventDispatcher({}).register({
     }
 
     if (message.message_type !== "text") {
-      await replyWithTranslationForm(messageId);
+      await replyWithModeSelection(messageId);
       return;
     }
 
