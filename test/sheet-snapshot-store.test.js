@@ -69,6 +69,26 @@ test("无 key 表插入行并修改后续文案时仍能正确对齐", () => {
   ]);
 });
 
+test("重复中文被复制到新行时按增加数量识别新增", () => {
+  const repeated = "本次更新内容如下：新增多语言支持";
+  const changes = diffSheetRows(
+    ["固定前文", repeated, "固定后文"],
+    ["固定前文", repeated, repeated, repeated, "固定后文"],
+    3,
+  );
+  assert.equal(changes.filter((change) =>
+    change.type === "added" && change.currentText === repeated,
+  ).length, 2);
+});
+
+test("重复中文只移动位置且数量不变时不误报", () => {
+  const repeated = "重复文案";
+  assert.deepEqual(
+    diffSheetRows([repeated, "中间内容", repeated], [repeated, repeated, "中间内容"], 3),
+    [],
+  );
+});
+
 test("删除不产生翻译任务", () => {
   assert.deepEqual(diffSheetRows(["甲", "乙", "丙"], ["甲", "丙"], 8), []);
 });

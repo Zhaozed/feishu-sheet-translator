@@ -248,7 +248,27 @@ export function diffSheetRows(previousInput, currentInput, baseRow) {
     oldCursor = anchor.oldIndex + 1;
     newCursor = anchor.newIndex + 1;
   }
+  const previousCounts = new Map();
+  const currentCounts = new Map();
+  for (const text of previousRows) {
+    if (text) previousCounts.set(text, (previousCounts.get(text) ?? 0) + 1);
+  }
+  for (const text of currentRows) {
+    if (text) currentCounts.set(text, (currentCounts.get(text) ?? 0) + 1);
+  }
+  const remainingAddedCounts = new Map(
+    Array.from(currentCounts, ([text, count]) => [
+      text,
+      Math.max(0, count - (previousCounts.get(text) ?? 0)),
+    ]),
+  );
   return changes
-    .filter((change) => change.type !== "added" || !previousRows.includes(change.currentText))
+    .filter((change) => {
+      if (change.type !== "added") return true;
+      const remaining = remainingAddedCounts.get(change.currentText) ?? 0;
+      if (remaining <= 0) return false;
+      remainingAddedCounts.set(change.currentText, remaining - 1);
+      return true;
+    })
     .sort((a, b) => a.rowNumber - b.rowNumber);
 }
