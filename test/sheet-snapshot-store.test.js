@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -169,6 +169,25 @@ test("并发保存历史版本不会互相覆盖或破坏文件", async () => {
     await Promise.all([firstSave, store.save()]);
     const saved = JSON.parse(await readFile(path, "utf8"));
     assert.deepEqual(Object.keys(saved.sheets).sort(), ["doc-a:sheet-a", "doc-b:sheet-b"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("加载旧版历史文件时清空快照并写入新版本", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sheet-snapshots-migration-"));
+  const path = join(directory, "snapshots.json");
+  try {
+    await writeFile(path, JSON.stringify({
+      version: 1,
+      sheets: { "old-doc:old-sheet": { rows: ["旧快照"] } },
+    }));
+    const store = await new SheetSnapshotStore(path).load();
+    assert.equal(store.size(), 0);
+    assert.deepEqual(JSON.parse(await readFile(path, "utf8")), {
+      version: 2,
+      sheets: {},
+    });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

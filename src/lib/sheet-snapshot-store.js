@@ -1,17 +1,26 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
+const SNAPSHOT_STORE_VERSION = 2;
+
 export class SheetSnapshotStore {
   constructor(path) {
     this.path = path;
-    this.data = { version: 1, sheets: {} };
+    this.data = { version: SNAPSHOT_STORE_VERSION, sheets: {} };
     this.savePromise = Promise.resolve();
   }
 
   async load() {
     try {
       const parsed = JSON.parse(await readFile(this.path, "utf8"));
-      this.data = { version: 1, sheets: parsed?.sheets ?? {} };
+      if (parsed?.version === SNAPSHOT_STORE_VERSION) {
+        this.data = { version: SNAPSHOT_STORE_VERSION, sheets: parsed?.sheets ?? {} };
+      } else {
+        // Version 1 contains snapshots produced by the retired diff workflow.
+        // Clear them once during deployment so the next check establishes a clean baseline.
+        this.data = { version: SNAPSHOT_STORE_VERSION, sheets: {} };
+        await this.save();
+      }
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
     }
