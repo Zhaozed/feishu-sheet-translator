@@ -27,6 +27,10 @@ export class SheetSnapshotStore {
     );
   }
 
+  size() {
+    return Object.keys(this.data.sheets).length;
+  }
+
   set(spreadsheetToken, sheetId, snapshot) {
     this.data.sheets[`${spreadsheetToken}:${sheetId}`] = snapshot;
   }

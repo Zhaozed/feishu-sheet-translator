@@ -58,6 +58,7 @@ const SHEET_SNAPSHOT_PATH = process.env.SHEET_SNAPSHOT_PATH || fileURLToPath(
   new URL("../data/sheet-snapshots.json", import.meta.url),
 );
 const sheetSnapshotStore = await new SheetSnapshotStore(SHEET_SNAPSHOT_PATH).load();
+console.log(`[历史版本存储] 路径=${SHEET_SNAPSHOT_PATH}，已加载 Sheet=${sheetSnapshotStore.size()}个`);
 let customLanguageRegistry = [];
 const LANGUAGE_NAMES = {
   en: "English",
@@ -1636,6 +1637,11 @@ async function prepareSheetSnapshotCheck(spreadsheetCommand) {
     ? []
     : diffSheetRows(snapshot.rows ?? [], rows, headerRowNumber + 1)
       .filter((change) => containsChineseText(change.currentText));
+  console.log(
+    `[Sheet 差异检查] 文档=${spreadsheetToken.slice(0, 6)}***，Sheet=${sheetId}，` +
+    `历史版本=${snapshot?.updatedAt ?? "无"}，历史行=${snapshot?.rows?.length ?? 0}，` +
+    `当前行=${rows.length}，差异=${changes.length}，表头变化=${Boolean(metadataChanged)}`,
+  );
   return {
     spreadsheetCommand,
     spreadsheetToken,
@@ -1682,6 +1688,12 @@ async function initializeDocumentSnapshots(spreadsheetCommand) {
   if (results.some((result) => result.status === "recorded")) {
     await sheetSnapshotStore.save();
   }
+  console.log(
+    `[文档自动记录] 文档=${spreadsheetToken.slice(0, 6)}***，扫描=${sheets.length}，` +
+    `新增记录=${results.filter((result) => result.status === "recorded").length}，` +
+    `已有记录=${results.filter((result) => result.status === "existing").length}，` +
+    `跳过=${results.filter((result) => result.status === "skipped").length}`,
+  );
   return { spreadsheetToken, sheets, results };
 }
 
@@ -1783,7 +1795,12 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
       messageId,
       buildMessageCard(
         "没有检测到中文更新",
-        `Sheet：**${task.sheet.title ?? task.sheetId}**\n\n与上次处理版本相比，简体中文没有新增或修改。删除内容不会生成翻译任务。`,
+        [
+          `Sheet：**${task.sheet.title ?? task.sheetId}**`,
+          `上次记录：${task.snapshot?.updatedAt ? new Date(task.snapshot.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "无"}`,
+          "",
+          "与上次处理版本相比，简体中文没有新增或修改。删除内容不会生成翻译任务。",
+        ].join("\n"),
         { template: "green" },
       ),
     );
