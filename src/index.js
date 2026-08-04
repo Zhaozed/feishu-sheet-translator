@@ -203,11 +203,11 @@ function buildUsageGuideCard() {
       "2. 表头包含 **“简体中文”** 和至少一个 **目标语言列**。",
       "3. 已将“产研翻译小助手”添加为表格应用，并授予 **编辑权限**。",
       "",
-      "**模式一：检查 Sheet 更新**",
-      "在刚修改的 Sheet 中复制链接，机器人对比该 Sheet 的中文快照，自动找出新增和修改行。",
+      "**模式一：检查并翻译更新**",
+      "在刚修改的 Sheet 中复制链接，机器人自动对比上次处理版本，找出新增和修改行。",
       "1. 链接必须包含 `sheet=` 参数。",
-      "2. 首次仅建立基线，不翻译历史内容。",
-      "3. 后续检查会展示完整差异，确认后仅翻译变化内容。",
+      "2. 系统自动保存上次处理版本，用户无需管理快照。",
+      "3. 检查后展示完整差异，确认后仅翻译新增和修改内容。",
       "4. 新增行默认仅填空白；修改行默认覆盖旧译文。",
       "",
       "**模式二：新增语种翻译**",
@@ -225,7 +225,7 @@ function buildUsageGuideCard() {
     {
       template: "turquoise",
       buttons: [
-        { name: "open_snapshot_check", text: "检查 Sheet 更新", type: "primary" },
+        { name: "open_snapshot_check", text: "检查并翻译更新", type: "primary" },
         { name: "open_new_locale_translation", text: "新增语种翻译" },
         { name: "open_existing_translation", text: "按行号手动翻译" },
       ],
@@ -238,7 +238,7 @@ function buildSnapshotCheckFormCard(prefill = {}) {
     config: { wide_screen_mode: true, update_multi: false },
     header: {
       template: "blue",
-      title: { tag: "plain_text", content: "检查 Sheet 更新" },
+      title: { tag: "plain_text", content: "检查并翻译 Sheet 更新" },
     },
     elements: [
       {
@@ -246,7 +246,7 @@ function buildSnapshotCheckFormCard(prefill = {}) {
         content: [
           "请在**刚刚修改的 Sheet** 中复制链接。",
           "机器人只对比链接指定的单个 Sheet，不扫描同文档其他 Sheet。",
-          "首次使用只建立当前简体中文基线。",
+          "系统会自动对比上次处理版本，用户无需填写 Sheet 名称或起止行号。",
         ].join("\n\n"),
       },
       {
@@ -1654,28 +1654,27 @@ function createSnapshotRecord(task) {
 }
 
 async function showSheetSnapshotResult(messageId, actorKey, task) {
-  pendingSnapshotTasks.set(actorKey, {
-    ...task,
-    expiresAt: Date.now() + CONFIRMATION_TTL_MS,
-  });
   if (!task.snapshot || task.metadataChanged) {
+    sheetSnapshotStore.set(
+      task.spreadsheetToken,
+      task.sheetId,
+      createSnapshotRecord(task),
+    );
+    await sheetSnapshotStore.save();
+    pendingSnapshotTasks.delete(actorKey);
     await replyWithCard(
       messageId,
       buildMessageCard(
-        task.metadataChanged ? "Sheet 表头结构已变化" : "首次建立 Sheet 基线",
+        task.metadataChanged ? "已重新开始记录 Sheet 更新" : "已开始记录 Sheet 更新",
         [
           `Sheet：**${task.sheet.title ?? task.sheetId}**`,
           `当前简体中文：${task.rows.filter(containsChineseText).length}条`,
           "",
-          "本次只保存当前简体中文基线，不翻译历史内容。",
+          task.metadataChanged
+            ? "检测到语言表头结构发生变化，系统已自动保存当前版本。下次检查时会直接识别新增和修改内容。"
+            : "这是系统首次处理该 Sheet，当前版本已自动保存。以后修改内容后再次检查，系统会直接识别并展示新增和修改内容。",
         ].join("\n"),
-        {
-          template: "orange",
-          buttons: [
-            { name: "confirm_establish_snapshot", text: "建立基线", type: "primary" },
-            { name: "cancel_snapshot_task", text: "取消" },
-          ],
-        },
+        { template: "green" },
       ),
     );
     return;
@@ -1686,12 +1685,16 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
       messageId,
       buildMessageCard(
         "没有检测到中文更新",
-        `Sheet：**${task.sheet.title ?? task.sheetId}**\n\n与上次基线相比，简体中文没有新增或修改。删除内容不会生成翻译任务。`,
+        `Sheet：**${task.sheet.title ?? task.sheetId}**\n\n与上次处理版本相比，简体中文没有新增或修改。删除内容不会生成翻译任务。`,
         { template: "green" },
       ),
     );
     return;
   }
+  pendingSnapshotTasks.set(actorKey, {
+    ...task,
+    expiresAt: Date.now() + CONFIRMATION_TTL_MS,
+  });
   const addedCount = task.changes.filter((change) => change.type === "added").length;
   const modifiedCount = task.changes.length - addedCount;
   const chunks = splitTextChunks(buildSnapshotChangeLines(task.changes));
@@ -1717,7 +1720,6 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
         template: "orange",
         buttons: [
           { name: "translate_snapshot_all", text: "翻译全部差异", type: "primary" },
-          { name: "ignore_snapshot_changes", text: "忽略并更新基线" },
           { name: "cancel_snapshot_task", text: "暂不处理" },
         ],
       },
@@ -2290,41 +2292,18 @@ async function handleCardAction(data) {
     return;
   }
 
-  if ([
-    "confirm_establish_snapshot",
-    "translate_snapshot_all",
-    "ignore_snapshot_changes",
-    "cancel_snapshot_task",
-  ].includes(actionName)) {
+  if (["translate_snapshot_all", "cancel_snapshot_task"].includes(actionName)) {
     const pending = pendingSnapshotTasks.get(actorKey);
     if (!pending || pending.expiresAt < Date.now()) {
       pendingSnapshotTasks.delete(actorKey);
-      await replyWithErrorCard(messageId, "Sheet 快照任务已失效，请重新检查。");
+      await replyWithErrorCard(messageId, "Sheet 更新任务已失效，请重新检查。");
       return;
     }
     if (actionName === "cancel_snapshot_task") {
       pendingSnapshotTasks.delete(actorKey);
       await replyWithCard(
         messageId,
-        buildMessageCard("已暂不处理", "本次未翻译，也未更新 Sheet 基线。", { template: "grey" }),
-      );
-      return;
-    }
-    if (actionName === "confirm_establish_snapshot" || actionName === "ignore_snapshot_changes") {
-      sheetSnapshotStore.set(
-        pending.spreadsheetToken,
-        pending.sheetId,
-        createSnapshotRecord(pending),
-      );
-      await sheetSnapshotStore.save();
-      pendingSnapshotTasks.delete(actorKey);
-      await replyWithCard(
-        messageId,
-        buildMessageCard(
-          actionName === "confirm_establish_snapshot" ? "Sheet 基线已建立" : "差异已忽略",
-          `Sheet：**${pending.sheet.title ?? pending.sheetId}**\n\n已保存当前简体中文作为新基线。`,
-          { template: "green" },
-        ),
+        buildMessageCard("已暂不处理", "本次没有翻译，检测到的更新会在下次检查时再次显示。", { template: "grey" }),
       );
       return;
     }
@@ -2355,7 +2334,7 @@ async function handleCardAction(data) {
         0,
       );
       if (failureCount > 0) {
-        throw new Error(`本次有 ${failureCount}个目标单元格翻译失败，Sheet 基线暂未更新；下次检查仍会显示这些中文变化。`);
+        throw new Error(`本次有 ${failureCount}个目标单元格翻译失败，系统未保存本次处理结果；下次检查仍会显示这些中文变化。`);
       }
       sheetSnapshotStore.set(
         latest.spreadsheetToken,
@@ -2367,8 +2346,8 @@ async function handleCardAction(data) {
       await replyWithCard(
         messageId,
         buildMessageCard(
-          "Sheet 快照已更新",
-          `已处理 ${safeChanges.length}行差异，并将当前简体中文保存为新基线。`,
+          "Sheet 更新翻译完成",
+          `已处理 ${safeChanges.length}行差异，系统已自动保存本次处理版本。`,
           { template: "green" },
         ),
       );
