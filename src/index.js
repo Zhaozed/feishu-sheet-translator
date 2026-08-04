@@ -2,13 +2,20 @@ import "dotenv/config";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import OpenAI from "openai";
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { AutoWorkflowStore } from "./lib/auto-workflow-store.js";
+import { getLanguageCellValue, isLanguageMetadataRow } from "./lib/language-metadata.js";
 
 const appId = process.env.FEISHU_APP_ID;
 const appSecret = process.env.FEISHU_APP_SECRET;
 const aiApiKey = process.env.AI_API_KEY || process.env.OPENAI_API_KEY;
 const aiBaseUrl = process.env.AI_BASE_URL || "https://api.deepseek.com";
 const aiModel = process.env.AI_MODEL || process.env.OPENAI_MODEL || "deepseek-v4-flash";
+const verificationToken = process.env.FEISHU_VERIFICATION_TOKEN || "";
+const encryptKey = process.env.FEISHU_ENCRYPT_KEY || "";
+const port = Number(process.env.PORT || 3000);
 
 if (!appId || !appSecret) {
   console.error(
@@ -40,15 +47,23 @@ const aiClient = aiApiKey
 const processedMessageIds = new Set();
 const pendingConfirmations = new Map();
 const pendingFullTableTranslations = new Map();
+const pendingAutoTranslations = new Map();
+const pendingEditWindows = new Map();
 const lastFormStateByActor = new Map();
 const lastWelcomeAtByChat = new Map();
 const MAX_COLUMNS_RANGE = "CV";
 const HEADER_SCAN_ROW_COUNT = 20;
 const TRANSLATION_CONCURRENCY = 4;
+const SHEET_SCAN_CONCURRENCY = 3;
+const EDIT_DEBOUNCE_MS = Number(process.env.EDIT_DEBOUNCE_MS || 25_000);
 const CONFIRMATION_TTL_MS = 10 * 60 * 1000;
 const TRANSIENT_RETRY_COUNT = 3;
 const WELCOME_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const LANGUAGE_REGISTRY_PATH = new URL("../data/languages.json", import.meta.url);
+const AUTO_WORKFLOW_STATE_PATH = process.env.AUTO_WORKFLOW_STATE_PATH || fileURLToPath(
+  new URL("../data/auto-workflow-state.json", import.meta.url),
+);
+const autoWorkflowStore = await new AutoWorkflowStore(AUTO_WORKFLOW_STATE_PATH).load();
 let customLanguageRegistry = [];
 const LANGUAGE_NAMES = {
   en: "English",
@@ -203,11 +218,15 @@ function buildUsageGuideCard() {
       "5. 翻译会参考上一行对应语种的 **术语和表达风格**。",
       "",
       "**模式二：新增语种翻译**",
-      "适合在表格末尾新增一个语言列，并将 **整张表的简体中文翻译成该语种**。",
+      "适合在整个文档的可处理 Sheet 末尾新增一个语言列，并翻译全部有效简体中文。",
       "1. 粘贴表格链接。",
       "2. 填写语言名称，例如“泰语”或“Thai”。",
       "3. 填写 **BCP 47 语言标签**，例如 `th`、`fr-CA`、`zh-Hant`。",
       "4. 检查任务规模；确认后，机器人新增语言列并回填全部有效内容。",
+      "",
+      "**模式三：自动翻译提醒**",
+      "用户主动开启后，机器人检测简体中文新增或修改，只私聊实际编辑事件的唯一操作者，确认后才更新已有译文。",
+      "删除不处理；多个实际编辑者冲突时不发消息。",
       "",
       "**安全边界**",
       "• **简体中文为空**的行不会翻译。",
@@ -219,9 +238,60 @@ function buildUsageGuideCard() {
       buttons: [
         { name: "open_existing_translation", text: "翻译新增内容", type: "primary" },
         { name: "open_new_locale_translation", text: "新增语种翻译" },
+        { name: "open_auto_workflow", text: "开启自动提醒" },
       ],
     },
   );
+}
+
+function buildAutoWorkflowFormCard(prefill = {}) {
+  return {
+    config: { wide_screen_mode: true, update_multi: false },
+    header: {
+      template: "turquoise",
+      title: { tag: "plain_text", content: "开启自动翻译提醒" },
+    },
+    elements: [
+      {
+        tag: "markdown",
+        content: [
+          "开启后，机器人只关注该文档各 Sheet 的**简体中文列**。",
+          "检测到新增或修改后，只会私聊实际编辑事件中的操作者，经确认才翻译。",
+          "删除不处理；新增语种仍需手动发起。",
+        ].join("\n\n"),
+      },
+      {
+        tag: "form",
+        name: "auto_workflow_form",
+        elements: [
+          {
+            tag: "input",
+            name: "sheet_url",
+            required: true,
+            width: "fill",
+            label: { tag: "plain_text", content: "飞书电子表格链接" },
+            placeholder: { tag: "plain_text", content: "粘贴 /sheets/ 或 /wiki/ 链接" },
+            default_value: normalizeCell(prefill.sheetUrl),
+          },
+          {
+            tag: "button",
+            name: "enable_auto_workflow",
+            action_type: "form_submit",
+            type: "primary",
+            text: { tag: "plain_text", content: "建立基线并开启" },
+            value: { action: "enable_auto_workflow" },
+          },
+        ],
+      },
+      {
+        tag: "note",
+        elements: [{
+          tag: "plain_text",
+          content: "首次仅建立当前中文基线，不会翻译历史内容。",
+        }],
+      },
+    ],
+  };
 }
 
 function buildTranslationFormCard(prefill = {}) {
@@ -344,7 +414,7 @@ function buildNewLocaleTranslationFormCard(prefill = {}) {
       {
         tag: "markdown",
         content:
-          "机器人会自动识别表头风格，在最后追加新语言列，并翻译该表全部有效的简体中文行。提交后会先展示任务规模，确认后才执行。",
+          "机器人会遍历整个文档的所有 Sheet，自动识别表头风格，在每个可处理的 Sheet 最后追加新语言列，并翻译全部有效的简体中文行。提交后会先展示任务规模，确认后才执行。",
       },
       {
         tag: "form",
@@ -384,7 +454,7 @@ function buildNewLocaleTranslationFormCard(prefill = {}) {
             name: "submit_new_locale_translation",
             action_type: "form_submit",
             type: "primary",
-            text: { tag: "plain_text", content: "检查全表任务" },
+            text: { tag: "plain_text", content: "检查整个文档" },
             value: { action: "submit_new_locale_translation" },
           },
         ],
@@ -448,7 +518,7 @@ async function replyWithCard(messageId, card) {
 
 async function sendCard(receiveId, receiveIdType, card) {
   const uuid = randomUUID();
-  await withTransientRetry(
+  return withTransientRetry(
     () =>
       client.im.v1.message.create({
         params: {
@@ -1498,6 +1568,115 @@ async function readRowsInChunks(
   return rows;
 }
 
+function containsChineseText(value) {
+  return /[\u3400-\u9fff]/u.test(normalizeCell(value));
+}
+
+async function readSheetChineseState(spreadsheetToken, sheet) {
+  const sheetId = sheet.sheet_id;
+  const headerRows = await readRange(
+    spreadsheetToken,
+    `${sheetId}!A1:${MAX_COLUMNS_RANGE}${HEADER_SCAN_ROW_COUNT}`,
+  );
+  const { headerRowNumber, headers } = findHeaderRow(headerRows);
+  const sourceColumn = headers.findIndex(
+    (header) => getLanguageTag(header)?.toLowerCase() === "zh-hans",
+  );
+  if (sourceColumn < 0) throw new Error("没有找到简体中文源语言列。");
+  const configuredRowCount = sheet.grid_properties?.row_count ?? sheet.row_count ?? 5000;
+  const maxRow = Math.min(Math.max(configuredRowCount, headerRowNumber + 1), 20000);
+  const sourceColumnLetters = columnIndexToLetters(sourceColumn);
+  const sourceRows = await readRowsInChunks(
+    spreadsheetToken,
+    sheetId,
+    headerRowNumber + 1,
+    maxRow,
+    sourceColumnLetters,
+    sourceColumnLetters,
+    500,
+  );
+  const rows = {};
+  sourceRows.forEach((row, index) => {
+    const text = normalizeCell(row[0]);
+    if (text) rows[headerRowNumber + 1 + index] = text;
+  });
+  return {
+    title: sheet.title ?? sheetId,
+    headerRowNumber,
+    sourceColumn,
+    rows,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function diffChineseState(previousState, currentState) {
+  const changes = [];
+  const previousRows = previousState?.rows ?? {};
+  for (const [rowNumber, currentText] of Object.entries(currentState.rows)) {
+    const previousText = normalizeCell(previousRows[rowNumber]);
+    if (!containsChineseText(currentText) || currentText === previousText) continue;
+    changes.push({
+      rowNumber: Number(rowNumber),
+      type: previousText ? "modified" : "added",
+      previousText,
+      currentText,
+    });
+  }
+  return changes.sort((a, b) => a.rowNumber - b.rowNumber);
+}
+
+async function subscribeToSpreadsheetEditEvents(spreadsheetToken) {
+  const response = await withTransientRetry(
+    () => client.request({
+      method: "POST",
+      url: `https://open.feishu.cn/open-apis/drive/v1/files/${spreadsheetToken}/subscribe`,
+      params: { file_type: "sheet" },
+    }),
+    "订阅电子表格编辑事件",
+  );
+  if (response.code !== 0) {
+    throw new Error(`订阅电子表格编辑事件失败：${response.msg || response.code}`);
+  }
+}
+
+async function enableAutoWorkflow(spreadsheetCommand, enabledBy) {
+  const spreadsheetToken = await resolveSpreadsheetToken(
+    spreadsheetCommand.resourceType,
+    spreadsheetCommand.resourceToken,
+  );
+  const sheets = await querySheets(spreadsheetToken);
+  const results = await mapWithConcurrency(
+    sheets,
+    SHEET_SCAN_CONCURRENCY,
+    async (sheet) => {
+      try {
+        const state = await readSheetChineseState(spreadsheetToken, sheet);
+        return { sheet, state };
+      } catch (error) {
+        return { sheet, error: formatFeishuError(error) };
+      }
+    },
+  );
+  const usable = results.filter((result) => result.state);
+  if (usable.length === 0) throw new Error("文档中没有可监听的简体中文 Sheet。");
+  await subscribeToSpreadsheetEditEvents(spreadsheetToken);
+  autoWorkflowStore.setDocument(spreadsheetToken, {
+    spreadsheetCommand,
+    enabledBy,
+    enabledAt: new Date().toISOString(),
+  });
+  for (const result of usable) {
+    autoWorkflowStore.setSheet(spreadsheetToken, result.sheet.sheet_id, result.state);
+  }
+  await autoWorkflowStore.save();
+  return {
+    spreadsheetToken,
+    totalSheets: sheets.length,
+    usableSheets: usable.length,
+    skippedSheets: results.length - usable.length,
+  };
+}
+
 async function prepareFullTableTranslation(
   spreadsheetCommand,
   languageName,
@@ -1596,11 +1775,63 @@ async function prepareFullTableTranslation(
   };
 }
 
-async function showFullTableTranslationPreview(messageId, actorKey, task) {
+async function prepareDocumentLocaleTranslation(
+  spreadsheetCommand,
+  languageName,
+  languageTag,
+) {
+  const spreadsheetToken = await resolveSpreadsheetToken(
+    spreadsheetCommand.resourceType,
+    spreadsheetCommand.resourceToken,
+  );
+  const sheets = (await querySheets(spreadsheetToken)).sort(
+    (a, b) => (a.index ?? 0) - (b.index ?? 0),
+  );
+  const scanResults = await mapWithConcurrency(
+    sheets,
+    SHEET_SCAN_CONCURRENCY,
+    async (sheet) => {
+      try {
+        return {
+          task: await prepareFullTableTranslation(
+            { ...spreadsheetCommand, requestedSheetId: sheet.sheet_id },
+            languageName,
+            languageTag,
+          ),
+        };
+      } catch (error) {
+        return {
+          skipped: {
+            sheet,
+            reason: formatFeishuError(error),
+          },
+        };
+      }
+    },
+  );
+  const tasks = scanResults.flatMap((result) => result.task ? [result.task] : []);
+  const skippedSheets = scanResults.flatMap((result) =>
+    result.skipped ? [result.skipped] : [],
+  );
+  if (tasks.length === 0) {
+    throw new Error("文档中没有可以新增该语种的 Sheet。");
+  }
+  return {
+    spreadsheetCommand,
+    languageName,
+    languageTag,
+    tasks,
+    skippedSheets,
+    totalRows: tasks.reduce((sum, task) => sum + task.validRowNumbers.length, 0),
+  };
+}
+
+async function showFullTableTranslationPreview(messageId, actorKey, documentTask) {
   pendingFullTableTranslations.set(actorKey, {
-    spreadsheetCommand: task.spreadsheetCommand,
-    languageName: task.languageName,
-    languageTag: task.languageTag,
+    spreadsheetCommand: documentTask.spreadsheetCommand,
+    languageName: documentTask.languageName,
+    languageTag: documentTask.languageTag,
+    documentTask,
     expiresAt: Date.now() + CONFIRMATION_TTL_MS,
   });
   await replyWithCard(
@@ -1608,12 +1839,12 @@ async function showFullTableTranslationPreview(messageId, actorKey, task) {
     buildMessageCard(
       "确认新增语种翻译",
       [
-        `工作表：${task.sheet.title ?? task.sheetId}`,
-        `表头：第${task.headerRowNumber}行`,
-        `识别到的表头风格：${task.style === "tagged" ? "名称 + 语言标签" : "纯语言名称"}`,
-        `将在 ${task.column} 列新增：**${task.newHeader}**`,
-        `有效简体中文：**${task.validRowNumbers.length}行**`,
-        `预计翻译并回填：**${task.validRowNumbers.length}个单元格**`,
+        `扫描 Sheet：${documentTask.tasks.length + documentTask.skippedSheets.length}个`,
+        `可处理 Sheet：**${documentTask.tasks.length}个**`,
+        `跳过 Sheet：${documentTask.skippedSheets.length}个`,
+        `新增语言：**${documentTask.languageName}（${documentTask.languageTag}）**`,
+        `有效简体中文：**${documentTask.totalRows}行**`,
+        `预计翻译并回填：**${documentTask.totalRows}个单元格**`,
         "",
         "确认后才会调用模型并写入表格；现有语言列不会被修改。",
         "该确认将在 10 分钟后失效。",
@@ -1623,7 +1854,7 @@ async function showFullTableTranslationPreview(messageId, actorKey, task) {
         buttons: [
           { name: "confirm_full_table_translation", text: "确认并开始", type: "primary" },
           { name: "cancel_full_table_translation", text: "取消" },
-          { text: "打开当前表格", url: task.spreadsheetCommand.originalUrl },
+          { text: "打开当前表格", url: documentTask.spreadsheetCommand.originalUrl },
         ],
       },
     ),
@@ -1653,16 +1884,16 @@ async function registerCustomLanguage(languageName, languageTag) {
   await saveLanguageRegistry();
 }
 
-async function executeFullTableTranslation(messageId, taskInput) {
+async function executeSingleFullTableTranslation(messageId, taskInput, quiet = false) {
   if (!aiClient) {
     throw new Error("尚未配置 AI_API_KEY，无法执行翻译。");
   }
-  const task = await prepareFullTableTranslation(
+  const task = taskInput.preparedTask ?? await prepareFullTableTranslation(
     taskInput.spreadsheetCommand,
     taskInput.languageName,
     taskInput.languageTag,
   );
-  await replyWithCard(
+  if (!quiet) await replyWithCard(
     messageId,
     buildMessageCard(
       "正在执行全表翻译",
@@ -1685,10 +1916,21 @@ async function executeFullTableTranslation(messageId, taskInput) {
   );
   const jobs = task.validRowNumbers.map((rowNumber) => {
     const row = allRows[rowNumber - task.headerRowNumber - 1] ?? [];
+    const targetValues = task.headers
+      .map((header, index) => ({
+        tag: getLanguageTag(header),
+        value: normalizeCell(row[index]),
+      }))
+      .filter((item) => item.tag && item.tag.toLowerCase() !== "zh-hans")
+      .map((item) => item.value);
+    const sourceText = normalizeCell(row[task.sourceColumn]);
     return {
       rowNumber,
-      sourceText: normalizeCell(row[task.sourceColumn]),
+      sourceText,
       rowContext: buildRowContext(task.headers, row),
+      deterministicValue: isLanguageMetadataRow(sourceText, targetValues)
+        ? getLanguageCellValue(task.languageTag, customLanguageRegistry)
+        : "",
     };
   });
   const results = await mapWithConcurrency(
@@ -1698,7 +1940,7 @@ async function executeFullTableTranslation(messageId, taskInput) {
       try {
         return {
           job,
-          translation: await translateText(
+          translation: job.deterministicValue || await translateText(
             job.sourceText,
             task.languageTag,
             job.rowContext,
@@ -1750,7 +1992,7 @@ async function executeFullTableTranslation(messageId, taskInput) {
   await writeRangesInChunks(task.spreadsheetToken, valueRanges);
   await registerCustomLanguage(task.languageName, task.languageTag);
 
-  await replyWithCard(
+  if (!quiet) await replyWithCard(
     messageId,
     buildMessageCard(
       failures.length > 0 || conflicts.size > 0
@@ -1774,6 +2016,189 @@ async function executeFullTableTranslation(messageId, taskInput) {
       },
     ),
   );
+}
+
+async function executeFullTableTranslation(messageId, taskInput) {
+  const documentTask = taskInput.documentTask ?? await prepareDocumentLocaleTranslation(
+    taskInput.spreadsheetCommand,
+    taskInput.languageName,
+    taskInput.languageTag,
+  );
+  let completed = 0;
+  const failures = [];
+
+  for (const task of documentTask.tasks) {
+    try {
+      await executeSingleFullTableTranslation(
+        messageId,
+        {
+          ...taskInput,
+          preparedTask: task,
+          spreadsheetCommand: {
+            ...taskInput.spreadsheetCommand,
+            requestedSheetId: task.sheetId,
+          },
+        },
+        true,
+      );
+      completed += 1;
+    } catch (error) {
+      failures.push({ sheet: task.sheet, reason: formatFeishuError(error) });
+    }
+  }
+
+  await replyWithCard(
+    messageId,
+    buildMessageCard(
+      failures.length ? "文档新增语种部分完成" : "文档新增语种完成",
+      [
+        `成功处理 Sheet：${completed}个`,
+        `执行失败 Sheet：${failures.length}个`,
+        `预检跳过 Sheet：${documentTask.skippedSheets.length}个`,
+        `计划翻译中文：${documentTask.totalRows}行`,
+        "",
+        `[打开当前表格](${taskInput.spreadsheetCommand.originalUrl})`,
+      ].join("\n"),
+      {
+        template: failures.length ? "orange" : "green",
+        buttons: [{
+          text: "打开当前表格",
+          url: taskInput.spreadsheetCommand.originalUrl,
+          type: "primary",
+        }],
+      },
+    ),
+  );
+}
+
+function buildAutoChangeLines(changes) {
+  return changes.map((change) => {
+    if (change.type === "added") {
+      return `• 新增｜第${change.rowNumber}行：${change.currentText}`;
+    }
+    return `• 修改｜第${change.rowNumber}行：${change.previousText} → ${change.currentText}`;
+  });
+}
+
+async function processEditWindow(windowKey) {
+  const window = pendingEditWindows.get(windowKey);
+  if (!window) return;
+  pendingEditWindows.delete(windowKey);
+  if (window.operatorIds.size !== 1) {
+    console.warn(
+      `[自动工作流] ${windowKey} 出现 ${window.operatorIds.size} 个实际编辑者，不归属也不发消息`,
+    );
+    return;
+  }
+  const operatorOpenId = [...window.operatorIds][0];
+  const document = autoWorkflowStore.getDocument(window.fileToken);
+  if (!document) return;
+  const sheets = await querySheets(window.fileToken);
+  const sheet = sheets.find((item) => item.sheet_id === window.sheetId);
+  if (!sheet) throw new Error(`找不到 Sheet ${window.sheetId}`);
+  const previousState = autoWorkflowStore.getSheet(window.fileToken, window.sheetId);
+  const currentState = await readSheetChineseState(window.fileToken, sheet);
+  const changes = diffChineseState(previousState, currentState);
+  autoWorkflowStore.setSheet(window.fileToken, window.sheetId, currentState);
+  await autoWorkflowStore.save();
+  if (changes.length === 0) {
+    console.log(`[自动工作流] ${windowKey} 未检测到中文新增或修改`);
+    return;
+  }
+  const taskId = randomUUID();
+  pendingAutoTranslations.set(taskId, {
+    taskId,
+    operatorOpenId,
+    spreadsheetCommand: {
+      ...document.spreadsheetCommand,
+      requestedSheetId: window.sheetId,
+    },
+    sheetTitle: currentState.title,
+    changes,
+    expiresAt: Date.now() + CONFIRMATION_TTL_MS,
+  });
+  const addedCount = changes.filter((change) => change.type === "added").length;
+  const modifiedCount = changes.length - addedCount;
+  const lines = buildAutoChangeLines(changes);
+  let detail = lines.join("\n");
+  if (detail.length > 18_000) {
+    detail = `${detail.slice(0, 18_000)}\n\n内容过长，卡片已截断；请打开表格复核。`;
+  }
+  await sendCard(
+    operatorOpenId,
+    "open_id",
+    buildMessageCard(
+      "检测到你刚刚更新了简体中文",
+      [
+        `Sheet：**${currentState.title}**`,
+        `总结：新增 ${addedCount} 行，修改 ${modifiedCount} 行。`,
+        "",
+        "**更新内容**",
+        detail,
+        "",
+        "是否将这些内容翻译到该 Sheet 已有的其他语言？",
+      ].join("\n"),
+      {
+        template: "orange",
+        buttons: [
+          {
+            name: "confirm_auto_translation",
+            text: "确认翻译",
+            type: "primary",
+            value: { task_id: taskId },
+          },
+          {
+            name: "cancel_auto_translation",
+            text: "暂不处理",
+            value: { task_id: taskId },
+          },
+          { text: "打开当前表格", url: document.spreadsheetCommand.originalUrl },
+        ],
+      },
+    ),
+  );
+}
+
+function queueSpreadsheetEdit(data) {
+  const event = data?.event ?? data ?? {};
+  const fileToken = normalizeCell(event.file_token);
+  const sheetId = normalizeCell(event.sheet_id);
+  const operatorIds = new Set(
+    (Array.isArray(event.operator_id_list) ? event.operator_id_list : [])
+      .map((operator) => normalizeCell(operator?.open_id))
+      .filter(Boolean),
+  );
+  console.log(
+    `[电子表格编辑] file=${fileToken || "缺失"} sheet=${sheetId || "缺失"} operators=${[...operatorIds].join(",") || "缺失"}`,
+  );
+  if (!fileToken || !sheetId || operatorIds.size === 0) return;
+  if (!autoWorkflowStore.getDocument(fileToken)) return;
+  const windowKey = `${fileToken}:${sheetId}`;
+  const existing = pendingEditWindows.get(windowKey) ?? {
+    fileToken,
+    sheetId,
+    operatorIds: new Set(),
+    timer: null,
+  };
+  for (const operatorId of operatorIds) existing.operatorIds.add(operatorId);
+  if (existing.timer) clearTimeout(existing.timer);
+  existing.timer = setTimeout(() => {
+    void processEditWindow(windowKey).catch((error) => {
+      console.error("[自动工作流处理失败]", formatFeishuError(error));
+    });
+  }, EDIT_DEBOUNCE_MS);
+  pendingEditWindows.set(windowKey, existing);
+}
+
+function groupConsecutiveRows(changes) {
+  const rows = [...new Set(changes.map((change) => change.rowNumber))].sort((a, b) => a - b);
+  const ranges = [];
+  for (const row of rows) {
+    const current = ranges.at(-1);
+    if (current && current.endRow + 1 === row) current.endRow = row;
+    else ranges.push({ startRow: row, endRow: row });
+  }
+  return ranges;
 }
 
 async function handleTextMessage(messageId, actorKey, text) {
@@ -1913,6 +2338,149 @@ async function handleCardAction(data) {
     return;
   }
 
+  if (actionName === "open_auto_workflow") {
+    const actionValue = getCardActionValue(action);
+    await replyWithCard(
+      messageId,
+      buildAutoWorkflowFormCard({ sheetUrl: actionValue.sheet_url }),
+    );
+    return;
+  }
+
+  if (actionName === "enable_auto_workflow") {
+    const values = getCardFormValues(action);
+    const sheetUrl = normalizeCell(values.sheet_url);
+    try {
+      const spreadsheetCommand = parseSpreadsheetUrl(sheetUrl);
+      const result = await enableAutoWorkflow(spreadsheetCommand, actorKey);
+      await replyWithCard(
+        messageId,
+        buildMessageCard(
+          "自动翻译提醒已开启",
+          [
+            `已建立基线 Sheet：${result.usableSheets}个`,
+            `跳过 Sheet：${result.skippedSheets}个`,
+            "",
+            "后续用户实际新增或修改简体中文后，机器人会私聊该次编辑事件的唯一操作者确认。",
+          "首次基线不会触发历史内容翻译。",
+          ].join("\n"),
+          {
+            template: "green",
+            buttons: [{
+              name: "disable_auto_workflow",
+              text: "关闭该文档自动提醒",
+              value: { spreadsheet_token: result.spreadsheetToken },
+            }],
+          },
+        ),
+      );
+    } catch (error) {
+      console.error("[开启自动工作流失败]", formatFeishuError(error));
+      await replyWithErrorCard(messageId, error, undefined, {
+        mode: "home",
+        sheet_url: sheetUrl,
+      });
+    }
+    return;
+  }
+
+  if (actionName === "disable_auto_workflow") {
+    const spreadsheetToken = normalizeCell(
+      getCardActionValue(action).spreadsheet_token,
+    );
+    const document = autoWorkflowStore.getDocument(spreadsheetToken);
+    if (!document) {
+      await replyWithErrorCard(messageId, "该文档未开启自动提醒。");
+      return;
+    }
+    if (document.enabledBy !== actorKey) {
+      await replyWithErrorCard(messageId, "只有开启该工作流的用户可以关闭。");
+      return;
+    }
+    autoWorkflowStore.removeDocument(spreadsheetToken);
+    await autoWorkflowStore.save();
+    await replyWithCard(
+      messageId,
+      buildMessageCard(
+        "自动提醒已关闭",
+        "该文档后续的编辑不再触发私聊确认；手动翻译仍可正常使用。",
+        { template: "grey" },
+      ),
+    );
+    return;
+  }
+
+  if (
+    actionName === "confirm_auto_translation" ||
+    actionName === "cancel_auto_translation"
+  ) {
+    const taskId = normalizeCell(getCardActionValue(action).task_id);
+    const pending = pendingAutoTranslations.get(taskId);
+    if (!pending || pending.expiresAt < Date.now()) {
+      pendingAutoTranslations.delete(taskId);
+      await replyWithErrorCard(messageId, "该自动翻译确认已失效。");
+      return;
+    }
+    if (pending.operatorOpenId !== actorKey) {
+      console.warn(`[自动翻译拒绝] 任务 ${taskId} 点击人不是编辑操作者`);
+      await replyWithErrorCard(messageId, "只有该次编辑事件的操作者可以确认此任务。");
+      return;
+    }
+    if (actionName === "cancel_auto_translation") {
+      pendingAutoTranslations.delete(taskId);
+      await replyWithCard(
+        messageId,
+        buildMessageCard("已暂不处理", "本次没有修改其他语言列。", { template: "grey" }),
+      );
+      return;
+    }
+    try {
+      const spreadsheetToken = await resolveSpreadsheetToken(
+        pending.spreadsheetCommand.resourceType,
+        pending.spreadsheetCommand.resourceToken,
+      );
+      const sheet = await resolveSheet(
+        spreadsheetToken,
+        pending.spreadsheetCommand.requestedSheetId,
+      );
+      const latestState = await readSheetChineseState(spreadsheetToken, sheet);
+      const safeChanges = pending.changes.filter(
+        (change) => normalizeCell(latestState.rows[change.rowNumber]) === change.currentText,
+      );
+      const changedAgainCount = pending.changes.length - safeChanges.length;
+      if (safeChanges.length === 0) {
+        throw new Error("待翻译的简体中文已再次变化，本次未执行；请以新的提醒为准。");
+      }
+      for (const range of groupConsecutiveRows(safeChanges)) {
+        await executeTranslationCommand(
+          messageId,
+          actorKey,
+          {
+            ...pending.spreadsheetCommand,
+            startRow: range.startRow,
+            endRow: range.endRow,
+          },
+          "overwrite",
+        );
+      }
+      if (changedAgainCount > 0) {
+        await replyWithCard(
+          messageId,
+          buildMessageCard(
+            "部分内容已跳过",
+            `${changedAgainCount}行简体中文在确认前再次变化，未按旧任务翻译。`,
+            { template: "orange" },
+          ),
+        );
+      }
+      pendingAutoTranslations.delete(taskId);
+    } catch (error) {
+      console.error("[自动翻译执行失败]", formatFeishuError(error));
+      await replyWithErrorCard(messageId, error, pending.spreadsheetCommand);
+    }
+    return;
+  }
+
   if (actionName === "open_new_locale_translation") {
     const actionValue = getCardActionValue(action);
     await replyWithNewLocaleTranslationForm(messageId, {
@@ -1944,7 +2512,7 @@ async function handleCardAction(data) {
         throw new Error("语言标签不符合 BCP 47 格式，例如 th、fr-CA 或 zh-Hant。");
       }
       spreadsheetCommand = parseSpreadsheetUrl(sheetUrl);
-      const task = await prepareFullTableTranslation(
+      const task = await prepareDocumentLocaleTranslation(
         spreadsheetCommand,
         languageName,
         languageTag,
@@ -2086,7 +2654,13 @@ async function handleCardAction(data) {
   }
 }
 
-const eventDispatcher = new Lark.EventDispatcher({}).register({
+const eventDispatcher = new Lark.EventDispatcher({
+  verificationToken,
+  encryptKey,
+}).register({
+  "drive.file.edit_v1": async (data) => {
+    queueSpreadsheetEdit(data);
+  },
   "card.action.trigger": async (data) => {
     const event = data?.event ?? data;
     const action = event?.action ?? {};
@@ -2104,9 +2678,9 @@ const eventDispatcher = new Lark.EventDispatcher({}).register({
           actionName === "submit_translation"
             ? "已提交，正在读取表格……"
             : actionName === "submit_new_locale_translation"
-              ? "已提交，正在扫描全表……"
+              ? "已提交，正在扫描整个文档……"
               : actionName === "confirm_full_table_translation"
-                ? "已确认，正在开始全表翻译……"
+                ? "已确认，正在处理文档内的 Sheet……"
             : "操作已提交",
       },
     };
@@ -2172,6 +2746,36 @@ const eventDispatcher = new Lark.EventDispatcher({}).register({
     });
   },
 });
+
+const webhookHandler = Lark.adaptDefault("/feishu/events", eventDispatcher, {
+  autoChallenge: Boolean(encryptKey),
+});
+const server = createServer((request, response) => {
+  if (request.url === "/health") {
+    response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    response.end(JSON.stringify({ ok: true }));
+    return;
+  }
+  if (request.url === "/feishu/events" && request.method === "POST") {
+    void webhookHandler(request, response).catch((error) => {
+      console.error("[Webhook 处理失败]", formatFeishuError(error));
+      if (!response.headersSent) response.writeHead(500);
+      response.end("error");
+    });
+    return;
+  }
+  response.writeHead(404);
+  response.end("not found");
+});
+server.listen(port, () => {
+  console.log(`Webhook 已监听端口 ${port}，回调路径 /feishu/events`);
+});
+
+for (const [spreadsheetToken] of autoWorkflowStore.listDocuments()) {
+  void subscribeToSpreadsheetEditEvents(spreadsheetToken).catch((error) => {
+    console.error(`[恢复文档订阅失败] ${spreadsheetToken}`, formatFeishuError(error));
+  });
+}
 
 console.log("正在连接飞书长连接……");
 await wsClient.start({ eventDispatcher });
