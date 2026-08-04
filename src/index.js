@@ -3,7 +3,9 @@ import * as Lark from "@larksuiteoapi/node-sdk";
 import OpenAI from "openai";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { getLanguageCellValue, isLanguageMetadataRow } from "./lib/language-metadata.js";
+import { diffSheetRows, SheetSnapshotStore } from "./lib/sheet-snapshot-store.js";
 
 const appId = process.env.FEISHU_APP_ID;
 const appSecret = process.env.FEISHU_APP_SECRET;
@@ -41,6 +43,7 @@ const aiClient = aiApiKey
 const processedMessageIds = new Set();
 const pendingConfirmations = new Map();
 const pendingFullTableTranslations = new Map();
+const pendingSnapshotTasks = new Map();
 const lastFormStateByActor = new Map();
 const lastWelcomeAtByChat = new Map();
 const MAX_COLUMNS_RANGE = "CV";
@@ -51,6 +54,10 @@ const CONFIRMATION_TTL_MS = 10 * 60 * 1000;
 const TRANSIENT_RETRY_COUNT = 3;
 const WELCOME_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const LANGUAGE_REGISTRY_PATH = new URL("../data/languages.json", import.meta.url);
+const SHEET_SNAPSHOT_PATH = process.env.SHEET_SNAPSHOT_PATH || fileURLToPath(
+  new URL("../data/sheet-snapshots.json", import.meta.url),
+);
+const sheetSnapshotStore = await new SheetSnapshotStore(SHEET_SNAPSHOT_PATH).load();
 let customLanguageRegistry = [];
 const LANGUAGE_NAMES = {
   en: "English",
@@ -196,13 +203,12 @@ function buildUsageGuideCard() {
       "2. 表头包含 **“简体中文”** 和至少一个 **目标语言列**。",
       "3. 已将“产研翻译小助手”添加为表格应用，并授予 **编辑权限**。",
       "",
-      "**模式一：翻译新增内容**",
-      "适合表格新增了一行或几行内容，需要把 **新增内容翻译成已有语种**。",
-      "1. 粘贴飞书电子表格链接。",
-      "2. **起始行只填写数字**；结束行留空时只翻译一行。",
-      "3. 批量任务单次最多处理 **100 行**。",
-      "4. 如果已有译文，机器人会先询问 **仅填空白** 还是 **覆盖全部**。",
-      "5. 翻译会参考上一行对应语种的 **术语和表达风格**。",
+      "**模式一：检查 Sheet 更新**",
+      "在刚修改的 Sheet 中复制链接，机器人对比该 Sheet 的中文快照，自动找出新增和修改行。",
+      "1. 链接必须包含 `sheet=` 参数。",
+      "2. 首次仅建立基线，不翻译历史内容。",
+      "3. 后续检查会展示完整差异，确认后仅翻译变化内容。",
+      "4. 新增行默认仅填空白；修改行默认覆盖旧译文。",
       "",
       "**模式二：新增语种翻译**",
       "适合在整个文档的可处理 Sheet 末尾新增一个语言列，并翻译全部有效简体中文。",
@@ -219,11 +225,64 @@ function buildUsageGuideCard() {
     {
       template: "turquoise",
       buttons: [
-        { name: "open_existing_translation", text: "翻译新增内容", type: "primary" },
+        { name: "open_snapshot_check", text: "检查 Sheet 更新", type: "primary" },
         { name: "open_new_locale_translation", text: "新增语种翻译" },
+        { name: "open_existing_translation", text: "按行号手动翻译" },
       ],
     },
   );
+}
+
+function buildSnapshotCheckFormCard(prefill = {}) {
+  return {
+    config: { wide_screen_mode: true, update_multi: false },
+    header: {
+      template: "blue",
+      title: { tag: "plain_text", content: "检查 Sheet 更新" },
+    },
+    elements: [
+      {
+        tag: "markdown",
+        content: [
+          "请在**刚刚修改的 Sheet** 中复制链接。",
+          "机器人只对比链接指定的单个 Sheet，不扫描同文档其他 Sheet。",
+          "首次使用只建立当前简体中文基线。",
+        ].join("\n\n"),
+      },
+      {
+        tag: "form",
+        name: "snapshot_check_form",
+        elements: [
+          {
+            tag: "input",
+            name: "sheet_url",
+            required: true,
+            width: "fill",
+            label: { tag: "plain_text", content: "飞书 Sheet 链接" },
+            placeholder: { tag: "plain_text", content: "链接应包含 ?sheet=..." },
+            default_value: normalizeCell(prefill.sheetUrl),
+          },
+          {
+            tag: "button",
+            name: "submit_snapshot_check",
+            action_type: "form_submit",
+            type: "primary",
+            text: { tag: "plain_text", content: "检查更新" },
+            value: { action: "submit_snapshot_check" },
+          },
+        ],
+      },
+      {
+        tag: "action",
+        actions: [{
+          tag: "button",
+          type: "default",
+          text: { tag: "plain_text", content: "改用行号手动翻译" },
+          value: { action: "open_existing_translation" },
+        }],
+      },
+    ],
+  };
 }
 
 function buildTranslationFormCard(prefill = {}) {
@@ -429,6 +488,10 @@ async function replyWithHelp(messageId) {
 
 async function replyWithNewLocaleTranslationForm(messageId, prefill = {}) {
   await replyWithCard(messageId, buildNewLocaleTranslationFormCard(prefill));
+}
+
+async function replyWithSnapshotCheckForm(messageId, prefill = {}) {
+  await replyWithCard(messageId, buildSnapshotCheckFormCard(prefill));
 }
 
 async function replyWithCard(messageId, card) {
@@ -1273,7 +1336,7 @@ async function executeTranslationCommand(
         },
       ),
     );
-    return;
+    return { requiresConfirmation: true, successes: [], failures: [] };
   }
 
   const mode = requestedMode ?? "fill_blank";
@@ -1312,7 +1375,7 @@ async function executeTranslationCommand(
         }],
       }),
     );
-    return;
+    return { requiresConfirmation: false, successes: [], failures: [] };
   }
 
   const jobsByTargetColumn = new Map();
@@ -1463,6 +1526,7 @@ async function executeTranslationCommand(
       },
     ),
   );
+  return { requiresConfirmation: false, successes, failures };
 }
 
 function inferLanguageHeaderStyle(headers) {
@@ -1498,6 +1562,181 @@ async function readRowsInChunks(
     }
   }
   return rows;
+}
+
+function containsChineseText(value) {
+  return /[\u3400-\u9fff]/u.test(normalizeCell(value));
+}
+
+async function prepareSheetSnapshotCheck(spreadsheetCommand) {
+  if (!spreadsheetCommand.requestedSheetId) {
+    throw new Error("链接没有指定 Sheet。请打开刚刚修改的 Sheet 后重新复制链接。");
+  }
+  const spreadsheetToken = await resolveSpreadsheetToken(
+    spreadsheetCommand.resourceType,
+    spreadsheetCommand.resourceToken,
+  );
+  const sheet = await resolveSheet(spreadsheetToken, spreadsheetCommand.requestedSheetId);
+  const sheetId = sheet.sheet_id;
+  const headerRows = await readRange(
+    spreadsheetToken,
+    `${sheetId}!A1:${MAX_COLUMNS_RANGE}${HEADER_SCAN_ROW_COUNT}`,
+  );
+  const { headerRowNumber, headers } = findHeaderRow(headerRows);
+  const sourceColumn = headers.findIndex(
+    (header) => getLanguageTag(header)?.toLowerCase() === "zh-hans",
+  );
+  if (sourceColumn < 0) throw new Error("没有找到简体中文源语言列。");
+  const configuredRowCount = sheet.grid_properties?.row_count ?? sheet.row_count ?? 5000;
+  const maxRow = Math.min(Math.max(configuredRowCount, headerRowNumber + 1), 20000);
+  const sourceColumnLetters = columnIndexToLetters(sourceColumn);
+  const sourceRows = await readRowsInChunks(
+    spreadsheetToken,
+    sheetId,
+    headerRowNumber + 1,
+    maxRow,
+    sourceColumnLetters,
+    sourceColumnLetters,
+    500,
+  );
+  const rows = sourceRows.map((row) => normalizeCell(row[0]));
+  while (rows.length > 0 && !rows.at(-1)) rows.pop();
+  const snapshot = sheetSnapshotStore.get(spreadsheetToken, sheetId);
+  const metadataChanged = snapshot && (
+    snapshot.headerRowNumber !== headerRowNumber || snapshot.sourceColumn !== sourceColumn
+  );
+  const changes = !snapshot || metadataChanged
+    ? []
+    : diffSheetRows(snapshot.rows ?? [], rows, headerRowNumber + 1)
+      .filter((change) => containsChineseText(change.currentText));
+  return {
+    spreadsheetCommand,
+    spreadsheetToken,
+    sheet,
+    sheetId,
+    headerRowNumber,
+    sourceColumn,
+    rows,
+    snapshot,
+    metadataChanged,
+    changes,
+  };
+}
+
+function buildSnapshotChangeLines(changes) {
+  return changes.map((change) => change.type === "added"
+    ? `• 新增｜第${change.rowNumber}行：${change.currentText}`
+    : `• 修改｜第${change.rowNumber}行：${change.previousText} → ${change.currentText}`);
+}
+
+function splitTextChunks(lines, maxLength = 12000) {
+  const chunks = [];
+  let current = "";
+  for (const line of lines) {
+    if (current && current.length + line.length + 1 > maxLength) {
+      chunks.push(current);
+      current = "";
+    }
+    current += `${current ? "\n" : ""}${line}`;
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function createSnapshotRecord(task) {
+  return {
+    title: task.sheet.title ?? task.sheetId,
+    headerRowNumber: task.headerRowNumber,
+    sourceColumn: task.sourceColumn,
+    rows: task.rows,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function showSheetSnapshotResult(messageId, actorKey, task) {
+  pendingSnapshotTasks.set(actorKey, {
+    ...task,
+    expiresAt: Date.now() + CONFIRMATION_TTL_MS,
+  });
+  if (!task.snapshot || task.metadataChanged) {
+    await replyWithCard(
+      messageId,
+      buildMessageCard(
+        task.metadataChanged ? "Sheet 表头结构已变化" : "首次建立 Sheet 基线",
+        [
+          `Sheet：**${task.sheet.title ?? task.sheetId}**`,
+          `当前简体中文：${task.rows.filter(containsChineseText).length}条`,
+          "",
+          "本次只保存当前简体中文基线，不翻译历史内容。",
+        ].join("\n"),
+        {
+          template: "orange",
+          buttons: [
+            { name: "confirm_establish_snapshot", text: "建立基线", type: "primary" },
+            { name: "cancel_snapshot_task", text: "取消" },
+          ],
+        },
+      ),
+    );
+    return;
+  }
+  if (task.changes.length === 0) {
+    pendingSnapshotTasks.delete(actorKey);
+    await replyWithCard(
+      messageId,
+      buildMessageCard(
+        "没有检测到中文更新",
+        `Sheet：**${task.sheet.title ?? task.sheetId}**\n\n与上次基线相比，简体中文没有新增或修改。删除内容不会生成翻译任务。`,
+        { template: "green" },
+      ),
+    );
+    return;
+  }
+  const addedCount = task.changes.filter((change) => change.type === "added").length;
+  const modifiedCount = task.changes.length - addedCount;
+  const chunks = splitTextChunks(buildSnapshotChangeLines(task.changes));
+  for (let index = 0; index < chunks.length; index += 1) {
+    await replyWithCard(
+      messageId,
+      buildMessageCard(
+        `Sheet 更新内容${chunks.length > 1 ? `（${index + 1}/${chunks.length}）` : ""}`,
+        [
+          index === 0 ? `Sheet：**${task.sheet.title ?? task.sheetId}**\n新增 ${addedCount}行，修改 ${modifiedCount}行。\n` : "",
+          chunks[index],
+        ].filter(Boolean).join("\n"),
+        { template: "blue" },
+      ),
+    );
+  }
+  await replyWithCard(
+    messageId,
+    buildMessageCard(
+      "确认翻译 Sheet 差异",
+      `共检测到 **${task.changes.length}行**变化。\n新增行仅填空白译文；修改行将覆盖已有译文。`,
+      {
+        template: "orange",
+        buttons: [
+          { name: "translate_snapshot_all", text: "翻译全部差异", type: "primary" },
+          { name: "ignore_snapshot_changes", text: "忽略并更新基线" },
+          { name: "cancel_snapshot_task", text: "暂不处理" },
+        ],
+      },
+    ),
+  );
+}
+
+function groupSnapshotRanges(changes) {
+  const groups = [];
+  for (const change of [...changes].sort((a, b) => a.rowNumber - b.rowNumber)) {
+    const mode = change.type === "added" ? "fill_blank" : "overwrite";
+    const current = groups.at(-1);
+    if (current && current.mode === mode && current.endRow + 1 === change.rowNumber) {
+      current.endRow = change.rowNumber;
+    } else {
+      groups.push({ startRow: change.rowNumber, endRow: change.rowNumber, mode });
+    }
+  }
+  return groups;
 }
 
 async function prepareFullTableTranslation(
@@ -1899,6 +2138,10 @@ async function handleTextMessage(messageId, actorKey, text) {
     await replyWithHelp(messageId);
     return;
   }
+  if (/检查.*(?:Sheet|更新)|对比.*(?:Sheet|快照)/i.test(text)) {
+    await replyWithSnapshotCheckForm(messageId);
+    return;
+  }
   if (/添加.*(?:语种|语言)|新增.*(?:语种|语言)/i.test(text)) {
     await replyWithNewLocaleTranslationForm(messageId);
     return;
@@ -2018,6 +2261,121 @@ async function handleCardAction(data) {
 
   if (actionName === "open_help") {
     await replyWithHelp(messageId);
+    return;
+  }
+
+  if (actionName === "open_snapshot_check") {
+    const actionValue = getCardActionValue(action);
+    await replyWithSnapshotCheckForm(messageId, { sheetUrl: actionValue.sheet_url });
+    return;
+  }
+
+  if (actionName === "submit_snapshot_check") {
+    const sheetUrl = normalizeCell(getCardFormValues(action).sheet_url);
+    let spreadsheetCommand;
+    try {
+      spreadsheetCommand = parseSpreadsheetUrl(sheetUrl);
+      await showSheetSnapshotResult(
+        messageId,
+        actorKey,
+        await prepareSheetSnapshotCheck(spreadsheetCommand),
+      );
+    } catch (error) {
+      console.error("[Sheet 快照检查失败]", formatFeishuError(error));
+      await replyWithErrorCard(messageId, error, spreadsheetCommand, {
+        mode: "home",
+        sheet_url: sheetUrl,
+      });
+    }
+    return;
+  }
+
+  if ([
+    "confirm_establish_snapshot",
+    "translate_snapshot_all",
+    "ignore_snapshot_changes",
+    "cancel_snapshot_task",
+  ].includes(actionName)) {
+    const pending = pendingSnapshotTasks.get(actorKey);
+    if (!pending || pending.expiresAt < Date.now()) {
+      pendingSnapshotTasks.delete(actorKey);
+      await replyWithErrorCard(messageId, "Sheet 快照任务已失效，请重新检查。");
+      return;
+    }
+    if (actionName === "cancel_snapshot_task") {
+      pendingSnapshotTasks.delete(actorKey);
+      await replyWithCard(
+        messageId,
+        buildMessageCard("已暂不处理", "本次未翻译，也未更新 Sheet 基线。", { template: "grey" }),
+      );
+      return;
+    }
+    if (actionName === "confirm_establish_snapshot" || actionName === "ignore_snapshot_changes") {
+      sheetSnapshotStore.set(
+        pending.spreadsheetToken,
+        pending.sheetId,
+        createSnapshotRecord(pending),
+      );
+      await sheetSnapshotStore.save();
+      pendingSnapshotTasks.delete(actorKey);
+      await replyWithCard(
+        messageId,
+        buildMessageCard(
+          actionName === "confirm_establish_snapshot" ? "Sheet 基线已建立" : "差异已忽略",
+          `Sheet：**${pending.sheet.title ?? pending.sheetId}**\n\n已保存当前简体中文作为新基线。`,
+          { template: "green" },
+        ),
+      );
+      return;
+    }
+    try {
+      const latest = await prepareSheetSnapshotCheck(pending.spreadsheetCommand);
+      const expectedByRow = new Map(pending.changes.map((change) => [change.rowNumber, change.currentText]));
+      const safeChanges = latest.changes.filter(
+        (change) => expectedByRow.get(change.rowNumber) === change.currentText,
+      );
+      if (safeChanges.length !== pending.changes.length) {
+        throw new Error("确认前简体中文再次变化，已停止执行；请重新检查 Sheet 更新。");
+      }
+      const executionResults = [];
+      for (const range of groupSnapshotRanges(safeChanges)) {
+        executionResults.push(await executeTranslationCommand(
+          messageId,
+          actorKey,
+          {
+            ...pending.spreadsheetCommand,
+            startRow: range.startRow,
+            endRow: range.endRow,
+          },
+          range.mode,
+        ));
+      }
+      const failureCount = executionResults.reduce(
+        (sum, result) => sum + (result?.failures?.length ?? 0),
+        0,
+      );
+      if (failureCount > 0) {
+        throw new Error(`本次有 ${failureCount}个目标单元格翻译失败，Sheet 基线暂未更新；下次检查仍会显示这些中文变化。`);
+      }
+      sheetSnapshotStore.set(
+        latest.spreadsheetToken,
+        latest.sheetId,
+        createSnapshotRecord(latest),
+      );
+      await sheetSnapshotStore.save();
+      pendingSnapshotTasks.delete(actorKey);
+      await replyWithCard(
+        messageId,
+        buildMessageCard(
+          "Sheet 快照已更新",
+          `已处理 ${safeChanges.length}行差异，并将当前简体中文保存为新基线。`,
+          { template: "green" },
+        ),
+      );
+    } catch (error) {
+      console.error("[Sheet 快照翻译失败]", formatFeishuError(error));
+      await replyWithErrorCard(messageId, error, pending.spreadsheetCommand);
+    }
     return;
   }
 
@@ -2221,6 +2579,8 @@ const eventDispatcher = new Lark.EventDispatcher({}).register({
         content:
           actionName === "submit_translation"
             ? "已提交，正在读取表格……"
+            : actionName === "submit_snapshot_check"
+              ? "已提交，正在对比当前 Sheet……"
             : actionName === "submit_new_locale_translation"
               ? "已提交，正在扫描整个文档……"
               : actionName === "confirm_full_table_translation"
@@ -2253,7 +2613,7 @@ const eventDispatcher = new Lark.EventDispatcher({}).register({
     console.log(`[机器人菜单] ${eventKey ?? "unknown"}`);
     const card =
       eventKey === "translate_existing"
-        ? buildTranslationFormCard()
+        ? buildSnapshotCheckFormCard()
         : eventKey === "translate_new_locale"
           ? buildNewLocaleTranslationFormCard()
           : eventKey === "translation_help"
