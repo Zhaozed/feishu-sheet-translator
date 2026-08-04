@@ -1601,6 +1601,20 @@ function containsChineseText(value) {
   return /[\u3400-\u9fff]/u.test(normalizeCell(value));
 }
 
+function countRemovedChineseRows(previousRows = [], currentRows = []) {
+  const counts = new Map();
+  for (const text of currentRows.filter(containsChineseText)) {
+    counts.set(text, (counts.get(text) ?? 0) + 1);
+  }
+  let removed = 0;
+  for (const text of previousRows.filter(containsChineseText)) {
+    const remaining = counts.get(text) ?? 0;
+    if (remaining > 0) counts.set(text, remaining - 1);
+    else removed += 1;
+  }
+  return removed;
+}
+
 async function prepareSheetSnapshotCheck(spreadsheetCommand) {
   if (!spreadsheetCommand.requestedSheetId) {
     throw new Error("链接没有指定 Sheet。请打开刚刚修改的 Sheet 后重新复制链接。");
@@ -1642,6 +1656,13 @@ async function prepareSheetSnapshotCheck(spreadsheetCommand) {
     ? []
     : diffSheetRows(snapshot.rows ?? [], rows, headerRowNumber + 1)
       .filter((change) => containsChineseText(change.currentText));
+  const removedChineseCount = snapshot && !metadataChanged
+    ? countRemovedChineseRows(snapshot.rows ?? [], rows)
+    : 0;
+  const rowStructureChanged = Boolean(
+    snapshot && !metadataChanged &&
+    JSON.stringify(snapshot.rows ?? []) !== JSON.stringify(rows),
+  );
   console.log(
     `[Sheet 差异检查] 文档=${spreadsheetToken.slice(0, 6)}***，Sheet=${sheetId}，` +
     `历史版本=${snapshot?.updatedAt ?? "无"}，历史行=${snapshot?.rows?.length ?? 0}，` +
@@ -1658,16 +1679,21 @@ async function prepareSheetSnapshotCheck(spreadsheetCommand) {
     snapshot,
     metadataChanged,
     changes,
+    removedChineseCount,
+    rowStructureChanged,
   };
 }
 
 function snapshotCheckSignature(task) {
-  return JSON.stringify(task.changes.map((change) => [
-    change.type,
-    change.rowNumber,
-    change.previousText,
-    change.currentText,
-  ]));
+  return JSON.stringify({
+    rows: task.rows,
+    changes: task.changes.map((change) => [
+      change.type,
+      change.rowNumber,
+      change.previousText,
+      change.currentText,
+    ]),
+  });
 }
 
 async function prepareStableSheetSnapshotCheck(spreadsheetCommand) {
@@ -1828,15 +1854,30 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
     return;
   }
   if (task.changes.length === 0) {
+    if (task.rowStructureChanged) {
+      sheetSnapshotStore.set(
+        task.spreadsheetToken,
+        task.sheetId,
+        createSnapshotRecord(task),
+      );
+      await sheetSnapshotStore.save();
+    }
     await replyWithCard(
       messageId,
       buildMessageCard(
-        "没有检测到中文更新",
+        task.rowStructureChanged ? "检测到结构调整，无需翻译" : "没有检测到中文更新",
         [
           `Sheet：**${task.sheet.title ?? task.sheetId}**`,
           `上次记录：${task.snapshot?.updatedAt ? new Date(task.snapshot.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "无"}`,
           "",
-          "与上次处理版本相比，简体中文没有新增或修改。删除内容不会生成翻译任务。",
+          task.rowStructureChanged
+            ? [
+                `可翻译的新增或修改：0条`,
+                `删除的中文：${task.removedChineseCount}条`,
+                "检测到删除、清空、移动行或空白行变化；这些操作不需要翻译。",
+                "系统已自动保存当前行结构，后续检查将从当前版本继续对比。",
+              ].join("\n")
+            : "与上次处理版本相比，简体中文没有新增或修改。",
         ].join("\n"),
         { template: "green" },
       ),
@@ -1859,6 +1900,9 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
         `Sheet 更新内容${chunks.length > 1 ? `（${index + 1}/${chunks.length}）` : ""}`,
         [
           index === 0 ? `Sheet：**${task.sheet.title ?? task.sheetId}**\n新增 ${addedCount}行，修改 ${modifiedCount}行。\n` : "",
+          index === 0 && task.removedChineseCount > 0
+            ? `另检测到删除 ${task.removedChineseCount}条，按规则忽略且不翻译。\n`
+            : "",
           chunks[index],
         ].filter(Boolean).join("\n"),
         { template: "blue" },
