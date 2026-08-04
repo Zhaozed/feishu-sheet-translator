@@ -1268,6 +1268,7 @@ async function executeTranslationCommand(
   actorKey,
   command,
   requestedMode,
+  quiet = false,
 ) {
   if (!aiClient) {
     throw new Error(
@@ -1374,7 +1375,7 @@ async function executeTranslationCommand(
     ),
   );
 
-  await replyWithCard(
+  if (!quiet) await replyWithCard(
     messageId,
     buildMessageCard(
       "正在翻译",
@@ -1391,7 +1392,7 @@ async function executeTranslationCommand(
   );
 
   if (jobs.length === 0) {
-    await replyWithCard(
+    if (!quiet) await replyWithCard(
       messageId,
       buildMessageCard("无需翻译", "所有目标语言列都已有内容，本次没有修改表格。", {
         template: "green",
@@ -1530,7 +1531,7 @@ async function executeTranslationCommand(
       summary.push(`其余 ${failures.length - 20} 个失败项未在卡片中展开。`);
     }
   }
-  await replyWithCard(
+  if (!quiet) await replyWithCard(
     messageId,
     buildMessageCard(
       failures.length > 0 ? "翻译部分完成" : "翻译完成",
@@ -1656,6 +1657,25 @@ async function prepareSheetSnapshotCheck(spreadsheetCommand) {
   };
 }
 
+function snapshotCheckSignature(task) {
+  return JSON.stringify(task.changes.map((change) => [
+    change.type,
+    change.rowNumber,
+    change.previousText,
+    change.currentText,
+  ]));
+}
+
+async function prepareStableSheetSnapshotCheck(spreadsheetCommand) {
+  const first = await prepareSheetSnapshotCheck(spreadsheetCommand);
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  const second = await prepareSheetSnapshotCheck(spreadsheetCommand);
+  if (snapshotCheckSignature(first) === snapshotCheckSignature(second)) return second;
+  console.log("[Sheet 差异检查] 两次读取结果不一致，等待后再次确认");
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  return prepareSheetSnapshotCheck(spreadsheetCommand);
+}
+
 async function initializeDocumentSnapshots(spreadsheetCommand) {
   const spreadsheetToken = await resolveSpreadsheetToken(
     spreadsheetCommand.resourceType,
@@ -1729,7 +1749,7 @@ async function handleSpreadsheetLinkMessage(messageId, actorKey, spreadsheetComm
   await showSheetSnapshotResult(
     messageId,
     actorKey,
-    await prepareSheetSnapshotCheck(spreadsheetCommand),
+    await prepareStableSheetSnapshotCheck(spreadsheetCommand),
   );
 }
 
@@ -2405,7 +2425,7 @@ async function handleCardAction(data) {
       await showSheetSnapshotResult(
         messageId,
         actorKey,
-        await prepareSheetSnapshotCheck(spreadsheetCommand),
+        await prepareStableSheetSnapshotCheck(spreadsheetCommand),
       );
     } catch (error) {
       console.error("[Sheet 快照检查失败]", formatFeishuError(error));
@@ -2441,9 +2461,19 @@ async function handleCardAction(data) {
       if (safeChanges.length !== pending.changes.length) {
         throw new Error("确认前简体中文再次变化，已停止执行；请重新检查 Sheet 更新。");
       }
-      const executionResults = [];
-      for (const range of groupSnapshotRanges(safeChanges)) {
-        executionResults.push(await executeTranslationCommand(
+      const ranges = groupSnapshotRanges(safeChanges);
+      await replyWithCard(
+        messageId,
+        buildMessageCard(
+          "正在批量翻译 Sheet 更新",
+          `共 ${safeChanges.length}行变化，已合并为一个批次并行处理，请稍候……`,
+          { template: "blue" },
+        ),
+      );
+      const executionResults = await mapWithConcurrency(
+        ranges,
+        Math.min(3, ranges.length),
+        (range) => executeTranslationCommand(
           messageId,
           actorKey,
           {
@@ -2452,8 +2482,9 @@ async function handleCardAction(data) {
             endRow: range.endRow,
           },
           range.mode,
-        ));
-      }
+          true,
+        ),
+      );
       const failureCount = executionResults.reduce(
         (sum, result) => sum + (result?.failures?.length ?? 0),
         0,
