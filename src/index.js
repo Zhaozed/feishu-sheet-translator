@@ -5,7 +5,11 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { getLanguageCellValue, isLanguageMetadataRow } from "./lib/language-metadata.js";
-import { diffSheetRows, SheetSnapshotStore } from "./lib/sheet-snapshot-store.js";
+import {
+  diffSheetRecords,
+  diffSheetRows,
+  SheetSnapshotStore,
+} from "./lib/sheet-snapshot-store.js";
 
 const appId = process.env.FEISHU_APP_ID;
 const appSecret = process.env.FEISHU_APP_SECRET;
@@ -226,29 +230,30 @@ function buildUsageGuideCard() {
   return buildMessageCard(
     "产研翻译小助手｜使用说明",
     [
-      "我会对比 Sheet 的上次处理版本，找出简体中文的新增和修改，并在你确认后批量翻译。",
+      "我会对比 Sheet 的上次处理版本，找出需要翻译的简体中文，并在你确认后批量处理。",
       "",
-      "**一、先授权一次**",
+      "**三个按钮怎么选**",
+      "1. **检查并翻译更新**：最常用。调整某个 Sheet 的中文后，用它找出需要更新或补充译文的行并批量处理。",
+      "2. **手动按行号翻译**：知道具体行号，或自动检查结果不符合预期时，用它指定行号翻译。",
+      "3. **新增语种翻译**：给整份文档增加一种新语言时使用，例如新增越南语；会扫描文档内所有 Sheet。",
+      "",
+      "**使用前先授权一次**",
       "1. 打开目标电子表格，在右上角菜单中选择 **添加文档应用**。",
       "2. 添加“产研翻译小助手”，并授予 **编辑权限**。",
       "3. 飞书会向机器人发送授权链接；机器人收到后自动扫描并记录该文档所有可处理 Sheet。",
       "4. 如果没有收到“已自动记录整份文档”，直接发送任意 Sheet 链接也可以完成初始化。",
       "",
-      "**二、日常更新已有翻译**",
+      "**日常更新已有翻译**",
       "修改某个 Sheet 的 **简体中文 / zh-Hans** 列后：",
       "1. 直接发送该 Sheet 的链接，或点击下方 **检查并翻译更新** 手动粘贴链接。",
-      "2. 机器人展示全部新增和修改；确认后合并为一个批次翻译。",
+      "2. 机器人展示需要翻译的行和当前中文；确认后合并为一个批次翻译。",
       "3. 翻译全部成功后，系统自动保存本次版本。删除内容不会触发翻译。",
       "",
-      "**三、“自动”的边界**",
+      "**“自动”的边界**",
       "• 自动完成的是：授权链接初始化、差异识别、批量翻译和版本保存。",
       "• 机器人不会实时监听表格；修改后仍需发送 Sheet 链接或点击手动检查按钮。",
       "• 首次记录只能保存当时内容，无法识别首次记录之前发生的修改。",
       "• 只检查链接指定的一个 Sheet；只处理含中文的简体中文列，删除及其他列变化会忽略。",
-      "",
-      "**其他入口**",
-      "• **手动按行号翻译**：自动识别异常时的兜底。",
-      "• **新增语种翻译**：低频操作，手动扫描整份文档并新增语言列。",
     ].join("\n"),
     {
       template: "turquoise",
@@ -648,6 +653,8 @@ function buildFormRecovery(command, recovery = {}) {
 function recoveryActionName(recovery) {
   return recovery.mode === "existing"
     ? "resume_existing_translation"
+    : recovery.mode === "snapshot"
+      ? "resume_snapshot_check"
     : recovery.mode === "new_locale"
       ? "resume_new_locale_translation"
       : "open_mode_selection";
@@ -722,7 +729,9 @@ async function replyWithErrorCard(messageId, error, command, recoveryInput) {
         buttons: [
           {
             name: recoveryActionName(recovery),
-            text: isNetworkError ? "重新发起" : "重新填写",
+            text: recovery.mode === "snapshot"
+              ? "重新检查"
+              : isNetworkError ? "重新发起" : "重新填写",
             type: "primary",
             value: recovery,
           },
@@ -1364,6 +1373,9 @@ async function executeTranslationCommand(
           buttons: [
             { name: "confirm_fill_blank", text: "仅填空白", type: "primary" },
             { name: "confirm_overwrite", text: "覆盖全部", type: "danger" },
+            ...(command.originalUrl
+              ? [{ text: "打开当前表格", url: command.originalUrl }]
+              : []),
             { name: "confirm_cancel", text: "取消" },
           ],
         },
@@ -1405,7 +1417,9 @@ async function executeTranslationCommand(
           text: "发起新翻译",
           type: "primary",
           value: buildFormRecovery(command, { mode: "existing" }),
-        }],
+        }, ...(command.originalUrl
+          ? [{ text: "打开当前表格", url: command.originalUrl }]
+          : [])],
       }),
     );
     return { requiresConfirmation: false, successes: [], failures: [] };
@@ -1601,18 +1615,23 @@ function containsChineseText(value) {
   return /[\u3400-\u9fff]/u.test(normalizeCell(value));
 }
 
-function countRemovedChineseRows(previousRows = [], currentRows = []) {
+function countRemovedChineseRows(previousRows = [], currentRows = [], sourceChanges = []) {
   const counts = new Map();
   for (const text of currentRows.filter(containsChineseText)) {
     counts.set(text, (counts.get(text) ?? 0) + 1);
   }
-  let removed = 0;
+  const removedCounts = new Map();
   for (const text of previousRows.filter(containsChineseText)) {
     const remaining = counts.get(text) ?? 0;
     if (remaining > 0) counts.set(text, remaining - 1);
-    else removed += 1;
+    else removedCounts.set(text, (removedCounts.get(text) ?? 0) + 1);
   }
-  return removed;
+  for (const change of sourceChanges) {
+    if (!["modified", "uncertain"].includes(change.type)) continue;
+    const remaining = removedCounts.get(change.previousText) ?? 0;
+    if (remaining > 0) removedCounts.set(change.previousText, remaining - 1);
+  }
+  return Array.from(removedCounts.values()).reduce((sum, count) => sum + count, 0);
 }
 
 async function prepareSheetSnapshotCheck(spreadsheetCommand) {
@@ -1652,6 +1671,9 @@ async function prepareSheetSnapshotCheck(spreadsheetCommand) {
   const targetColumns = headers
     .map((header, index) => ({ index, tag: getLanguageTag(header) }))
     .filter((column) => column.tag && column.tag.toLowerCase() !== "zh-hans");
+  const metadataColumns = headers
+    .map((header, index) => ({ index, tag: getLanguageTag(header) }))
+    .filter((column) => !column.tag && column.index !== sourceColumn);
   const currentFullRows = rows.length > 0
     ? await readRowsInChunks(
         spreadsheetToken,
@@ -1679,21 +1701,41 @@ async function prepareSheetSnapshotCheck(spreadsheetCommand) {
       blankTargetTags: blankTargets.map((column) => column.tag),
     }];
   });
+  const rowRecords = rows.map((sourceText, index) => {
+    const row = currentFullRows[index] ?? [];
+    return {
+      sourceText,
+      metadataValues: metadataColumns.map((column) => normalizeCell(row[column.index])),
+      targetValues: targetColumns.map((column) =>
+        normalizeCell(row[column.index]) ? "filled" : "",
+      ),
+    };
+  });
   const snapshot = sheetSnapshotStore.get(spreadsheetToken, sheetId);
   const metadataChanged = snapshot && (
     snapshot.headerRowNumber !== headerRowNumber || snapshot.sourceColumn !== sourceColumn
   );
   const sourceChanges = !snapshot || metadataChanged
     ? []
-    : diffSheetRows(snapshot.rows ?? [], rows, headerRowNumber + 1)
+    : (Array.isArray(snapshot.rowRecords)
+        ? diffSheetRecords(snapshot.rowRecords, rowRecords, headerRowNumber + 1)
+        : diffSheetRows(snapshot.rows ?? [], rows, headerRowNumber + 1))
       .filter((change) => containsChineseText(change.currentText));
-  const changedRows = new Set(sourceChanges.map((change) => change.rowNumber));
+  const missingByRow = new Map(
+    missingTranslationRows.map((change) => [change.rowNumber, change]),
+  );
+  const enrichedSourceChanges = sourceChanges.map((change) => ({
+    ...change,
+    blankTargetCount: missingByRow.get(change.rowNumber)?.blankTargetCount ?? 0,
+    blankTargetTags: missingByRow.get(change.rowNumber)?.blankTargetTags ?? [],
+  }));
+  const changedRows = new Set(enrichedSourceChanges.map((change) => change.rowNumber));
   const changes = [
-    ...sourceChanges,
+    ...enrichedSourceChanges,
     ...missingTranslationRows.filter((change) => !changedRows.has(change.rowNumber)),
   ].sort((a, b) => a.rowNumber - b.rowNumber);
   const removedChineseCount = snapshot && !metadataChanged
-    ? countRemovedChineseRows(snapshot.rows ?? [], rows)
+    ? countRemovedChineseRows(snapshot.rows ?? [], rows, sourceChanges)
     : 0;
   const rowStructureChanged = Boolean(
     snapshot && !metadataChanged &&
@@ -1704,6 +1746,17 @@ async function prepareSheetSnapshotCheck(spreadsheetCommand) {
     `历史版本=${snapshot?.updatedAt ?? "无"}，历史行=${snapshot?.rows?.length ?? 0}，` +
     `当前行=${rows.length}，差异=${changes.length}，表头变化=${Boolean(metadataChanged)}`,
   );
+  for (const change of changes.slice(0, 20)) {
+    const shorten = (value) => normalizeCell(value).replace(/\s+/g, " ").slice(0, 80);
+    console.log(
+      `[Sheet 差异明细] 类型=${change.type}，行=${change.rowNumber}，` +
+      `旧=${JSON.stringify(shorten(change.previousText))}，` +
+      `新=${JSON.stringify(shorten(change.currentText))}`,
+    );
+  }
+  if (changes.length > 20) {
+    console.log(`[Sheet 差异明细] 其余 ${changes.length - 20}行未展开`);
+  }
   return {
     spreadsheetCommand,
     spreadsheetToken,
@@ -1712,6 +1765,7 @@ async function prepareSheetSnapshotCheck(spreadsheetCommand) {
     headerRowNumber,
     sourceColumn,
     rows,
+    rowRecords,
     snapshot,
     metadataChanged,
     changes,
@@ -1737,17 +1791,20 @@ function snapshotCheckSignature(task) {
 
 async function prepareStableSheetSnapshotCheck(spreadsheetCommand) {
   const first = await prepareSheetSnapshotCheck(spreadsheetCommand);
-  await new Promise((resolve) => setTimeout(resolve, 2000));
+  await new Promise((resolve) => setTimeout(resolve, 3000));
   const second = await prepareSheetSnapshotCheck(spreadsheetCommand);
   await new Promise((resolve) => setTimeout(resolve, 3000));
   const third = await prepareSheetSnapshotCheck(spreadsheetCommand);
+  await new Promise((resolve) => setTimeout(resolve, 4000));
+  const fourth = await prepareSheetSnapshotCheck(spreadsheetCommand);
   if (
     snapshotCheckSignature(first) !== snapshotCheckSignature(second) ||
-    snapshotCheckSignature(second) !== snapshotCheckSignature(third)
+    snapshotCheckSignature(second) !== snapshotCheckSignature(third) ||
+    snapshotCheckSignature(third) !== snapshotCheckSignature(fourth)
   ) {
     console.log("[Sheet 差异检查] 连续读取结果不一致，以等待后的最新结果为准");
   }
-  return third;
+  return fourth;
 }
 
 async function initializeDocumentSnapshots(spreadsheetCommand) {
@@ -1802,7 +1859,7 @@ async function handleSpreadsheetLinkMessage(messageId, actorKey, spreadsheetComm
     buildMessageCard(
       wasManaged ? "正在检查 Sheet 更新" : "正在初始化文档",
       wasManaged
-        ? "⏳ 正在等待飞书同步最新内容并连续核对，通常需要 **5–15 秒**，请勿重复提交。"
+        ? "⏳ 正在等待飞书同步最新内容并连续核对，通常需要 **10–20 秒**，请勿重复提交。"
         : "⏳ 正在扫描文档内所有 Sheet 并保存初始版本，通常需要 **10–60 秒**，请稍候。",
       { template: "blue" },
     ),
@@ -1820,7 +1877,7 @@ async function handleSpreadsheetLinkMessage(messageId, actorKey, spreadsheetComm
           `已记录：${recorded.length}个`,
           `跳过：${skipped.length}个`,
           "",
-          "以后修改简体中文后，把刚修改的 Sheet 链接发给我，我会直接展示新增和修改内容。",
+          "以后调整简体中文后，把刚处理的 Sheet 链接发给我，我会直接展示需要翻译的内容。",
         ].join("\n"),
         { template: recorded.length > 0 && !skipped.length ? "green" : "orange" },
       ),
@@ -1837,12 +1894,26 @@ async function handleSpreadsheetLinkMessage(messageId, actorKey, spreadsheetComm
   );
 }
 
-function buildSnapshotChangeLines(changes) {
-  return changes.map((change) => change.type === "added"
-    ? `• 新增｜第${change.rowNumber}行：${change.currentText}`
-    : change.type === "missing"
-      ? `• 译文缺失｜第${change.rowNumber}行：缺少 ${change.blankTargetCount}个语种｜${change.currentText}`
-      : `• 修改｜第${change.rowNumber}行：${change.previousText} → ${change.currentText}`);
+function quoteSnapshotText(text) {
+  return normalizeCell(text)
+    .split("\n")
+    .map((line) => (line || "　").replace(/^(\s*\d+)\./, "$1\\."))
+    .join("\n");
+}
+
+function buildSnapshotChangeSections(changes) {
+  const items = [...changes].sort((left, right) => left.rowNumber - right.rowNumber);
+  return [
+    `\n<font color="blue">**🔵 需要翻译的内容（${items.length}行）**</font>`,
+    ...items.map((change, itemIndex) => {
+      const divider = itemIndex > 0 ? "\n────────────\n" : "";
+      return divider + [
+        `<font color="blue">**第${change.rowNumber}行**</font>`,
+        "**当前中文：**",
+        quoteSnapshotText(change.currentText),
+      ].join("\n");
+    }),
+  ];
 }
 
 function splitTextChunks(lines, maxLength = 12000) {
@@ -1865,6 +1936,7 @@ function createSnapshotRecord(task) {
     headerRowNumber: task.headerRowNumber,
     sourceColumn: task.sourceColumn,
     rows: task.rows,
+    rowRecords: task.rowRecords,
     updatedAt: new Date().toISOString(),
   };
 }
@@ -1886,10 +1958,10 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
           `当前简体中文：${task.rows.filter(containsChineseText).length}条`,
           "",
           task.metadataChanged
-            ? "检测到语言表头结构发生变化，系统已自动保存当前版本。下次检查时会直接识别新增和修改内容。"
+            ? "检测到语言表头结构发生变化，系统已自动保存当前版本。下次检查时会直接识别需要翻译的内容。"
             : task.missingTranslationRows.length > 0
               ? `当前版本已自动保存，同时发现 ${task.missingTranslationRows.length}行存在译文缺失，将继续展示待翻译内容。`
-              : "这是系统首次处理该 Sheet，当前版本已自动保存。以后修改内容后再次检查，系统会直接识别并展示新增和修改内容。",
+              : "这是系统首次处理该 Sheet，当前版本已自动保存。以后调整内容后再次检查，系统会直接识别并展示需要翻译的内容。",
         ].join("\n"),
         { template: "green" },
       ),
@@ -1899,7 +1971,8 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
     task.metadataChanged = false;
   }
   if (task.changes.length === 0) {
-    if (task.rowStructureChanged) {
+    const needsSnapshotUpgrade = !Array.isArray(task.snapshot?.rowRecords);
+    if (task.rowStructureChanged || needsSnapshotUpgrade) {
       sheetSnapshotStore.set(
         task.spreadsheetToken,
         task.sheetId,
@@ -1910,76 +1983,105 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
     await replyWithCard(
       messageId,
       buildMessageCard(
-        task.rowStructureChanged ? "检测到结构调整，无需翻译" : "没有检测到中文更新",
+        "没有需要翻译的内容",
         [
           `Sheet：**${task.sheet.title ?? task.sheetId}**`,
-          `上次记录：${task.snapshot?.updatedAt ? new Date(task.snapshot.updatedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "无"}`,
           "",
-          task.rowStructureChanged
-            ? [
-                `可翻译的新增或修改：0条`,
-                `删除的中文：${task.removedChineseCount}条`,
-                "检测到删除、清空、移动行或空白行变化；这些操作不需要翻译。",
-                "系统已自动保存当前行结构，后续检查将从当前版本继续对比。",
-              ].join("\n")
-            : "与上次处理版本相比，简体中文没有新增或修改。",
+          "当前没有发现需要翻译的内容。若刚刚完成编辑，可重新检查一次。",
         ].join("\n"),
-        { template: "green" },
+        {
+          template: "green",
+          buttons: [{
+            name: "retry_snapshot_check",
+            text: "重新检查",
+            type: "primary",
+            value: { sheet_url: task.spreadsheetCommand.originalUrl },
+          }],
+        },
       ),
     );
     return;
   }
   const snapshotTaskId = randomUUID();
+  for (const existing of pendingSnapshotTasks.values()) {
+    if (
+      existing.actorKey === actorKey &&
+      existing.spreadsheetToken === task.spreadsheetToken &&
+      existing.sheetId === task.sheetId &&
+      existing.status === "pending" &&
+      !existing.processing
+    ) {
+      existing.status = "superseded";
+    }
+  }
   pendingSnapshotTasks.set(snapshotTaskId, {
     ...task,
     actorKey,
+    status: "pending",
     expiresAt: Date.now() + CONFIRMATION_TTL_MS,
   });
-  const addedCount = task.changes.filter((change) => change.type === "added").length;
-  const modifiedCount = task.changes.filter((change) => change.type === "modified").length;
-  const missingCount = task.changes.filter((change) => change.type === "missing").length;
-  const chunks = splitTextChunks(buildSnapshotChangeLines(task.changes));
+  const chunks = splitTextChunks(buildSnapshotChangeSections(task.changes), 20000);
   for (let index = 0; index < chunks.length; index += 1) {
+    const isLast = index === chunks.length - 1;
     await replyWithCard(
       messageId,
       buildMessageCard(
-        `Sheet 更新内容${chunks.length > 1 ? `（${index + 1}/${chunks.length}）` : ""}`,
+        `确认翻译${chunks.length > 1 ? `（${index + 1}/${chunks.length}）` : ""}`,
         [
           index === 0
-            ? `Sheet：**${task.sheet.title ?? task.sheetId}**\n新增 ${addedCount}行，修改 ${modifiedCount}行，译文缺失 ${missingCount}行。\n`
-            : "",
-          index === 0 && task.removedChineseCount > 0
-            ? `另检测到删除 ${task.removedChineseCount}条，按规则忽略且不翻译。\n`
+            ? [
+                `Sheet：**${task.sheet.title ?? task.sheetId}**`,
+                "",
+                `需处理：**${task.changes.length}行**`,
+                "",
+              ].filter(Boolean).join("\n")
             : "",
           chunks[index],
+          isLast
+            ? "\n请核对以上行是否完整。无 Key 表遇到整行复制、移动或重复文案时可能出现行号错位；如有遗漏，请先重新检查，仍不完整时使用手动按行号翻译。"
+            : "",
         ].filter(Boolean).join("\n"),
-        { template: "blue" },
+        {
+          template: isLast ? "orange" : "blue",
+          buttons: isLast
+            ? [
+                {
+                  name: "translate_snapshot_all",
+                  text: "确认并翻译",
+                  type: "primary",
+                  value: {
+                    snapshot_task_id: snapshotTaskId,
+                    sheet_url: task.spreadsheetCommand.originalUrl,
+                  },
+                },
+                {
+                  name: "retry_snapshot_check",
+                  text: "重新检查",
+                  value: { sheet_url: task.spreadsheetCommand.originalUrl },
+                },
+                {
+                  name: "open_existing_translation",
+                  text: "手动按行号翻译",
+                  value: { sheet_url: task.spreadsheetCommand.originalUrl },
+                },
+                {
+                  text: "打开当前表格",
+                  url: task.spreadsheetCommand.originalUrl,
+                },
+                {
+                  name: "cancel_snapshot_task",
+                  text: "暂不处理",
+                  value: {
+                    snapshot_task_id: snapshotTaskId,
+                    sheet_url: task.spreadsheetCommand.originalUrl,
+                  },
+                },
+              ]
+            : [],
+        },
       ),
     );
   }
-  await replyWithCard(
-    messageId,
-    buildMessageCard(
-      "确认翻译 Sheet 差异",
-      `共检测到 **${task.changes.length}行**需要处理。\n新增和译文缺失行仅填空白目标列；修改行将覆盖已有译文。`,
-      {
-        template: "orange",
-        buttons: [
-          {
-            name: "translate_snapshot_all",
-            text: "翻译全部差异",
-            type: "primary",
-            value: { snapshot_task_id: snapshotTaskId },
-          },
-          {
-            name: "cancel_snapshot_task",
-            text: "暂不处理",
-            value: { snapshot_task_id: snapshotTaskId },
-          },
-        ],
-      },
-    ),
-  );
 }
 
 function groupSnapshotRanges(changes) {
@@ -2399,7 +2501,10 @@ async function handleTextMessage(messageId, actorKey, text) {
       await handleSpreadsheetLinkMessage(messageId, actorKey, spreadsheetLink);
     } catch (error) {
       console.error("[自动处理表格链接失败]", formatFeishuError(error));
-      await replyWithErrorCard(messageId, error, spreadsheetLink);
+      await replyWithErrorCard(messageId, error, spreadsheetLink, {
+        mode: "snapshot",
+        sheet_url: spreadsheetLink.originalUrl,
+      });
     }
     return;
   }
@@ -2513,6 +2618,12 @@ async function handleCardAction(data) {
     return;
   }
 
+  if (actionName === "resume_snapshot_check") {
+    const recovery = recoverFormState(actorKey, action, "snapshot");
+    await replyWithSnapshotCheckForm(messageId, { sheetUrl: recovery.sheet_url });
+    return;
+  }
+
   if (actionName === "resume_new_locale_translation") {
     const recovery = recoverFormState(actorKey, action, "new_locale");
     await replyWithNewLocaleTranslationForm(messageId, {
@@ -2548,7 +2659,7 @@ async function handleCardAction(data) {
         messageId,
         buildMessageCard(
           "正在检查 Sheet 更新",
-          "⏳ 正在等待飞书同步最新内容并连续核对，通常需要 **5–15 秒**，请勿重复点击。",
+          "⏳ 正在等待飞书同步最新内容并连续核对，通常需要 **10–20 秒**，请勿重复点击。",
           { template: "blue" },
         ),
       );
@@ -2560,7 +2671,35 @@ async function handleCardAction(data) {
     } catch (error) {
       console.error("[Sheet 快照检查失败]", formatFeishuError(error));
       await replyWithErrorCard(messageId, error, spreadsheetCommand, {
-        mode: "home",
+        mode: "snapshot",
+        sheet_url: sheetUrl,
+      });
+    }
+    return;
+  }
+
+  if (actionName === "retry_snapshot_check") {
+    const sheetUrl = normalizeCell(getCardActionValue(action).sheet_url);
+    let spreadsheetCommand;
+    try {
+      spreadsheetCommand = parseSpreadsheetUrl(sheetUrl);
+      await replyWithCard(
+        messageId,
+        buildMessageCard(
+          "正在重新检查 Sheet 更新",
+          "⏳ 正在读取飞书最新内容并连续核对，通常需要 **10–20 秒**，请勿重复点击。",
+          { template: "blue" },
+        ),
+      );
+      await showSheetSnapshotResult(
+        messageId,
+        actorKey,
+        await prepareStableSheetSnapshotCheck(spreadsheetCommand),
+      );
+    } catch (error) {
+      console.error("[Sheet 重新检查失败]", formatFeishuError(error));
+      await replyWithErrorCard(messageId, error, spreadsheetCommand, {
+        mode: "snapshot",
         sheet_url: sheetUrl,
       });
     }
@@ -2568,11 +2707,46 @@ async function handleCardAction(data) {
   }
 
   if (["translate_snapshot_all", "cancel_snapshot_task"].includes(actionName)) {
-    const snapshotTaskId = normalizeCell(getCardActionValue(action).snapshot_task_id);
+    const actionValue = getCardActionValue(action);
+    const snapshotTaskId = normalizeCell(actionValue.snapshot_task_id);
+    const sheetUrl = normalizeCell(actionValue.sheet_url);
     const pending = pendingSnapshotTasks.get(snapshotTaskId);
-    if (!pending || pending.expiresAt < Date.now()) {
-      if (snapshotTaskId) pendingSnapshotTasks.delete(snapshotTaskId);
-      await replyWithErrorCard(messageId, "Sheet 更新任务已失效，请重新检查。");
+    if (pending && pending.status === "pending" && pending.expiresAt < Date.now()) {
+      pending.status = "expired";
+    }
+    if (!pending || pending.status !== "pending") {
+      const status = pending?.status ?? "missing";
+      const statusMessage = {
+        completed: "这批更新已经翻译完成，无需重复执行。",
+        superseded: "这不是最新的检查结果，请使用后面生成的新卡片，或立即重新检查。",
+        cancelled: "这批更新已选择暂不处理，可以重新检查后再次确认。",
+        expired: "该确认结果已超过 10 分钟，为避免翻译过期内容，需要重新检查。",
+        missing: "该任务来自旧服务或旧卡片，当前服务无法恢复，需要重新检查。",
+      }[status];
+      const retryUrl = pending?.spreadsheetCommand?.originalUrl || sheetUrl;
+      await replyWithCard(
+        messageId,
+        buildMessageCard(
+          status === "completed" ? "该批更新已处理" : "请使用最新检查结果",
+          statusMessage,
+          {
+            template: status === "completed" ? "green" : "orange",
+            buttons: retryUrl
+              ? [{
+                  name: "retry_snapshot_check",
+                  text: "重新检查",
+                  type: "primary",
+                  value: { sheet_url: retryUrl },
+                }]
+              : [{
+                  name: "open_snapshot_check",
+                  text: "重新检查",
+                  type: "primary",
+                  value: {},
+                }],
+          },
+        ),
+      );
       return;
     }
     if (pending.actorKey !== actorKey) {
@@ -2587,7 +2761,7 @@ async function handleCardAction(data) {
       return;
     }
     if (actionName === "cancel_snapshot_task") {
-      pendingSnapshotTasks.delete(snapshotTaskId);
+      pending.status = "cancelled";
       await replyWithCard(
         messageId,
         buildMessageCard("已暂不处理", "本次没有翻译，检测到的更新会在下次检查时再次显示。", { template: "grey" }),
@@ -2598,7 +2772,28 @@ async function handleCardAction(data) {
       pending.processing = true;
       const latest = await prepareSheetSnapshotCheck(pending.spreadsheetCommand);
       if (snapshotCheckSignature(latest) !== snapshotCheckSignature(pending)) {
-        throw new Error("确认前简体中文再次变化，已停止执行；请重新检查 Sheet 更新。");
+        pending.status = "superseded";
+        await replyWithCard(
+          messageId,
+          buildMessageCard(
+            "表格内容有新变化",
+            `Sheet：**${pending.sheet.title ?? pending.sheetId}**\n\n系统正在自动刷新检查结果。若结果仍不完整，可点击重新检查。`,
+            {
+              template: "blue",
+              buttons: [{
+                name: "retry_snapshot_check",
+                text: "重新检查",
+                value: { sheet_url: pending.spreadsheetCommand.originalUrl },
+              }],
+            },
+          ),
+        );
+        await showSheetSnapshotResult(
+          messageId,
+          actorKey,
+          await prepareStableSheetSnapshotCheck(pending.spreadsheetCommand),
+        );
+        return;
       }
       const safeChanges = latest.changes;
       const ranges = groupSnapshotRanges(safeChanges);
@@ -2638,19 +2833,29 @@ async function handleCardAction(data) {
         createSnapshotRecord(latest),
       );
       await sheetSnapshotStore.save();
-      pendingSnapshotTasks.delete(snapshotTaskId);
+      pending.status = "completed";
       await replyWithCard(
         messageId,
         buildMessageCard(
           "Sheet 更新翻译完成",
-          `已处理 ${safeChanges.length}行差异，系统已自动保存本次处理版本。`,
-          { template: "green" },
+          `Sheet：**${latest.sheet.title ?? latest.sheetId}**\n\n已处理 ${safeChanges.length}行内容，系统已自动保存本次处理版本。`,
+          {
+            template: "green",
+            buttons: [{
+              text: "打开当前表格",
+              url: latest.spreadsheetCommand.originalUrl,
+              type: "primary",
+            }],
+          },
         ),
       );
     } catch (error) {
       pending.processing = false;
       console.error("[Sheet 快照翻译失败]", formatFeishuError(error));
-      await replyWithErrorCard(messageId, error, pending.spreadsheetCommand);
+      await replyWithErrorCard(messageId, error, pending.spreadsheetCommand, {
+        mode: "snapshot",
+        sheet_url: pending.spreadsheetCommand.originalUrl,
+      });
     }
     return;
   }
@@ -2887,8 +3092,10 @@ const eventDispatcher = new Lark.EventDispatcher({}).register({
         content:
           actionName === "submit_translation"
             ? "已提交，预计 5–15 秒完成预检"
-            : actionName === "submit_snapshot_check"
-              ? "已提交，预计 5–15 秒完成检查"
+              : actionName === "submit_snapshot_check"
+                ? "已提交，预计 10–20 秒完成检查"
+              : actionName === "retry_snapshot_check"
+                ? "正在重新检查，预计 10–20 秒完成"
             : actionName === "submit_new_locale_translation"
               ? "已提交，预计 10–60 秒完成扫描"
               : actionName === "confirm_full_table_translation"
@@ -2930,6 +3137,8 @@ const eventDispatcher = new Lark.EventDispatcher({}).register({
     const card =
       eventKey === "translate_existing"
         ? buildSnapshotCheckFormCard()
+        : eventKey === "translate_manual_rows"
+          ? buildTranslationFormCard()
         : eventKey === "translate_new_locale"
           ? buildNewLocaleTranslationFormCard()
           : eventKey === "translation_help"

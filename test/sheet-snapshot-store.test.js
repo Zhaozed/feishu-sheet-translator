@@ -3,7 +3,11 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { diffSheetRows, SheetSnapshotStore } from "../src/lib/sheet-snapshot-store.js";
+import {
+  diffSheetRecords,
+  diffSheetRows,
+  SheetSnapshotStore,
+} from "../src/lib/sheet-snapshot-store.js";
 
 test("识别单行新增而不误报后续行", () => {
   const changes = diffSheetRows(["甲", "乙", "丙"], ["甲", "新增", "乙", "丙"], 8);
@@ -95,6 +99,63 @@ test("删除不产生翻译任务", () => {
 
 test("行移动但内容不变时不误报", () => {
   assert.deepEqual(diffSheetRows(["甲", "乙", "丙"], ["乙", "甲", "丙"], 8), []);
+});
+
+test("完整行特征使用非语言列作为弱 Key 识别中文修改", () => {
+  const changes = diffSheetRecords(
+    [
+      { sourceText: "旧登录文案", metadataValues: ["1.2.0", "登录"], targetValues: ["Old login"] },
+      { sourceText: "固定文案", metadataValues: ["1.2.0", "首页"], targetValues: ["Home"] },
+    ],
+    [
+      { sourceText: "新登录文案", metadataValues: ["1.2.0", "登录"], targetValues: ["Old login"] },
+      { sourceText: "固定文案", metadataValues: ["1.2.0", "首页"], targetValues: ["Home"] },
+    ],
+    3,
+  );
+  assert.deepEqual(changes, [{
+    type: "modified",
+    rowNumber: 3,
+    previousText: "旧登录文案",
+    currentText: "新登录文案",
+  }]);
+});
+
+test("完整行特征将目标语言全空的新行识别为新增", () => {
+  const changes = diffSheetRecords(
+    [
+      { sourceText: "固定前文", metadataValues: ["A"], targetValues: ["Fixed"] },
+      { sourceText: "旧文案", metadataValues: ["B"], targetValues: ["Old"] },
+    ],
+    [
+      { sourceText: "固定前文", metadataValues: ["A"], targetValues: ["Fixed"] },
+      { sourceText: "新增文案", metadataValues: ["C"], targetValues: [""] },
+      { sourceText: "旧文案", metadataValues: ["B"], targetValues: ["Old"] },
+    ],
+    3,
+  );
+  assert.deepEqual(changes, [{
+    type: "added",
+    rowNumber: 4,
+    previousText: "",
+    currentText: "新增文案",
+  }]);
+});
+
+test("没有弱 Key 时不强行把模糊配对声明为修改", () => {
+  assert.deepEqual(
+    diffSheetRecords(
+      [{ sourceText: "旧文案", metadataValues: [], targetValues: ["Old"] }],
+      [{ sourceText: "新文案", metadataValues: [], targetValues: ["Existing"] }],
+      5,
+    ),
+    [{
+      type: "uncertain",
+      rowNumber: 5,
+      previousText: "旧文案",
+      currentText: "新文案",
+    }],
+  );
 });
 
 test("并发保存历史版本不会互相覆盖或破坏文件", async () => {

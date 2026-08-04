@@ -7,5 +7,13 @@
     "aliases": [
       "泰语"
     ]
+  },
+  {
+    "name": "越南语",
+    "tag": "vi",
+    "modelLanguage": "越南语",
+    "aliases": [
+      "越南语"
+    ]
   }
 ]
