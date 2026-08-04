@@ -47,6 +47,28 @@ test("同时识别相邻的新增和修改", () => {
   ]);
 });
 
+test("无 key 表插入行并修改后续文案时仍能正确对齐", () => {
+  const changes = diffSheetRows(
+    ["开启定位", "登录失败提示", "退出账号", "删除账号"],
+    ["新增登录入口", "开启定位", "新版登录失败提示", "退出账号", "删除账号"],
+    8,
+  );
+  assert.deepEqual(changes, [
+    {
+      type: "added",
+      rowNumber: 8,
+      previousText: "",
+      currentText: "新增登录入口",
+    },
+    {
+      type: "modified",
+      rowNumber: 10,
+      previousText: "登录失败提示",
+      currentText: "新版登录失败提示",
+    },
+  ]);
+});
+
 test("删除不产生翻译任务", () => {
   assert.deepEqual(diffSheetRows(["甲", "乙", "丙"], ["甲", "丙"], 8), []);
 });

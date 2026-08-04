@@ -247,14 +247,14 @@ function buildUsageGuideCard() {
       "• 只检查链接指定的一个 Sheet；只处理含中文的简体中文列，删除及其他列变化会忽略。",
       "",
       "**其他入口**",
-      "• **按行号翻译**：自动识别异常时的兜底。",
+      "• **手动按行号翻译**：自动识别异常时的兜底。",
       "• **新增语种翻译**：低频操作，手动扫描整份文档并新增语言列。",
     ].join("\n"),
     {
       template: "turquoise",
       buttons: [
         { name: "open_snapshot_check", text: "检查并翻译更新", type: "primary" },
-        { name: "open_existing_translation", text: "按行号翻译" },
+        { name: "open_existing_translation", text: "手动按行号翻译" },
         { name: "open_new_locale_translation", text: "新增语种翻译" },
       ],
     },
@@ -305,7 +305,7 @@ function buildSnapshotCheckFormCard(prefill = {}) {
         actions: [{
           tag: "button",
           type: "default",
-          text: { tag: "plain_text", content: "改用行号手动翻译" },
+          text: { tag: "plain_text", content: "改用手动按行号翻译" },
           value: { action: "open_existing_translation" },
         }],
       },
@@ -323,7 +323,7 @@ function buildTranslationFormCard(prefill = {}) {
       template: "blue",
       title: {
         tag: "plain_text",
-        content: "翻译新增内容",
+        content: "手动按行号翻译",
       },
     },
     elements: [
@@ -390,7 +390,7 @@ function buildTranslationFormCard(prefill = {}) {
             type: "primary",
             text: {
               tag: "plain_text",
-              content: "开始翻译",
+              content: "手动按行号翻译",
             },
             value: {
               action: "submit_translation",
@@ -928,6 +928,10 @@ async function readRange(spreadsheetToken, range) {
     () => client.request({
       method: "GET",
       url: `https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/${spreadsheetToken}/values/${encodeURIComponent(range)}`,
+      headers: {
+        "Cache-Control": "no-cache, no-store",
+        Pragma: "no-cache",
+      },
     }),
     `读取单元格 ${range}`,
   );
@@ -1668,12 +1672,17 @@ function snapshotCheckSignature(task) {
 
 async function prepareStableSheetSnapshotCheck(spreadsheetCommand) {
   const first = await prepareSheetSnapshotCheck(spreadsheetCommand);
-  await new Promise((resolve) => setTimeout(resolve, 800));
+  await new Promise((resolve) => setTimeout(resolve, 2000));
   const second = await prepareSheetSnapshotCheck(spreadsheetCommand);
-  if (snapshotCheckSignature(first) === snapshotCheckSignature(second)) return second;
-  console.log("[Sheet 差异检查] 两次读取结果不一致，等待后再次确认");
-  await new Promise((resolve) => setTimeout(resolve, 600));
-  return prepareSheetSnapshotCheck(spreadsheetCommand);
+  await new Promise((resolve) => setTimeout(resolve, 3000));
+  const third = await prepareSheetSnapshotCheck(spreadsheetCommand);
+  if (
+    snapshotCheckSignature(first) !== snapshotCheckSignature(second) ||
+    snapshotCheckSignature(second) !== snapshotCheckSignature(third)
+  ) {
+    console.log("[Sheet 差异检查] 连续读取结果不一致，以等待后的最新结果为准");
+  }
+  return third;
 }
 
 async function initializeDocumentSnapshots(spreadsheetCommand) {
@@ -1723,6 +1732,16 @@ async function handleSpreadsheetLinkMessage(messageId, actorKey, spreadsheetComm
     spreadsheetCommand.resourceToken,
   );
   const wasManaged = sheetSnapshotStore.hasSpreadsheet(spreadsheetToken);
+  await replyWithCard(
+    messageId,
+    buildMessageCard(
+      wasManaged ? "正在检查 Sheet 更新" : "正在初始化文档",
+      wasManaged
+        ? "⏳ 正在等待飞书同步最新内容并连续核对，通常需要 **5–15 秒**，请勿重复提交。"
+        : "⏳ 正在扫描文档内所有 Sheet 并保存初始版本，通常需要 **10–60 秒**，请稍候。",
+      { template: "blue" },
+    ),
+  );
   const initialized = await initializeDocumentSnapshots(spreadsheetCommand);
   if (!wasManaged) {
     const recorded = initialized.results.filter((result) => result.status === "recorded");
@@ -2431,6 +2450,14 @@ async function handleCardAction(data) {
     let spreadsheetCommand;
     try {
       spreadsheetCommand = parseSpreadsheetUrl(sheetUrl);
+      await replyWithCard(
+        messageId,
+        buildMessageCard(
+          "正在检查 Sheet 更新",
+          "⏳ 正在等待飞书同步最新内容并连续核对，通常需要 **5–15 秒**，请勿重复点击。",
+          { template: "blue" },
+        ),
+      );
       await showSheetSnapshotResult(
         messageId,
         actorKey,
@@ -2458,6 +2485,13 @@ async function handleCardAction(data) {
       await replyWithErrorCard(messageId, "该确认任务不属于当前用户，请重新检查 Sheet 更新。");
       return;
     }
+    if (pending.processing) {
+      await replyWithCard(
+        messageId,
+        buildMessageCard("任务正在处理中", "⏳ 翻译尚未完成，请勿重复点击。", { template: "blue" }),
+      );
+      return;
+    }
     if (actionName === "cancel_snapshot_task") {
       pendingSnapshotTasks.delete(snapshotTaskId);
       await replyWithCard(
@@ -2467,6 +2501,7 @@ async function handleCardAction(data) {
       return;
     }
     try {
+      pending.processing = true;
       const latest = await prepareSheetSnapshotCheck(pending.spreadsheetCommand);
       if (snapshotCheckSignature(latest) !== snapshotCheckSignature(pending)) {
         throw new Error("确认前简体中文再次变化，已停止执行；请重新检查 Sheet 更新。");
@@ -2477,7 +2512,7 @@ async function handleCardAction(data) {
         messageId,
         buildMessageCard(
           "正在批量翻译 Sheet 更新",
-          `共 ${safeChanges.length}行变化，已合并为一个批次并行处理，请稍候……`,
+          `共 ${safeChanges.length}行变化，已合并为一个批次并行处理。通常需要 **20 秒–3 分钟**，请勿重复点击。`,
           { template: "blue" },
         ),
       );
@@ -2519,6 +2554,7 @@ async function handleCardAction(data) {
         ),
       );
     } catch (error) {
+      pending.processing = false;
       console.error("[Sheet 快照翻译失败]", formatFeishuError(error));
       await replyWithErrorCard(messageId, error, pending.spreadsheetCommand);
     }
@@ -2566,6 +2602,14 @@ async function handleCardAction(data) {
         throw new Error("语言标签不符合 BCP 47 格式，例如 th、fr-CA 或 zh-Hant。");
       }
       spreadsheetCommand = parseSpreadsheetUrl(sheetUrl);
+      await replyWithCard(
+        messageId,
+        buildMessageCard(
+          "正在扫描新增语种任务",
+          "⏳ 正在检查整份文档的 Sheet 和待翻译数量，通常需要 **10–60 秒**，请勿重复提交。",
+          { template: "blue" },
+        ),
+      );
       const task = await prepareDocumentLocaleTranslation(
         spreadsheetCommand,
         languageName,
@@ -2610,6 +2654,14 @@ async function handleCardAction(data) {
       return;
     }
     try {
+      await replyWithCard(
+        messageId,
+        buildMessageCard(
+          "正在执行新增语种翻译",
+          `⏳ 正在批量处理整份文档，计划翻译约 ${pending.documentTask?.totalRows ?? "若干"}行。通常需要 **1–15 分钟**，请勿重复点击或修改目标区域。`,
+          { template: "blue" },
+        ),
+      );
       await executeFullTableTranslation(messageId, pending);
     } catch (error) {
       console.error("[新增语种翻译失败]", formatFeishuError(error));
@@ -2652,6 +2704,14 @@ async function handleCardAction(data) {
       return;
     }
     try {
+      await replyWithCard(
+        messageId,
+        buildMessageCard(
+          "正在执行手动按行号翻译",
+          "⏳ 正在生成并回填译文，通常需要 **20 秒–3 分钟**，请勿重复点击或修改目标行。",
+          { template: "blue" },
+        ),
+      );
       await executeTranslationCommand(
         messageId,
         actorKey,
@@ -2701,6 +2761,14 @@ async function handleCardAction(data) {
   }
 
   try {
+    await replyWithCard(
+      messageId,
+      buildMessageCard(
+        "正在读取指定行",
+        "⏳ 正在读取表格并检查已有译文，通常需要 **5–15 秒**，请勿重复提交。",
+        { template: "blue" },
+      ),
+    );
     await executeTranslationCommand(messageId, actorKey, command);
   } catch (error) {
     console.error("[卡片翻译任务失败]", formatFeishuError(error));
@@ -2724,13 +2792,21 @@ const eventDispatcher = new Lark.EventDispatcher({}).register({
         type: "info",
         content:
           actionName === "submit_translation"
-            ? "已提交，正在读取表格……"
+            ? "已提交，预计 5–15 秒完成预检"
             : actionName === "submit_snapshot_check"
-              ? "已提交，正在对比当前 Sheet……"
+              ? "已提交，预计 5–15 秒完成检查"
             : actionName === "submit_new_locale_translation"
-              ? "已提交，正在扫描整个文档……"
+              ? "已提交，预计 10–60 秒完成扫描"
               : actionName === "confirm_full_table_translation"
-                ? "已确认，正在处理文档内的 Sheet……"
+                ? "已确认，正在批量处理，请勿重复点击"
+              : actionName === "translate_snapshot_all"
+                ? "已确认，预计 20 秒–3 分钟完成"
+              : actionName === "confirm_fill_blank" || actionName === "confirm_overwrite"
+                ? "已确认，预计 20 秒–3 分钟完成"
+              : actionName === "open_snapshot_check" ||
+                  actionName === "open_existing_translation" ||
+                  actionName === "open_new_locale_translation"
+                ? "正在打开操作表单"
             : "操作已提交",
       },
     };
