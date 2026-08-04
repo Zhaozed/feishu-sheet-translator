@@ -1648,14 +1648,50 @@ async function prepareSheetSnapshotCheck(spreadsheetCommand) {
   );
   const rows = sourceRows.map((row) => normalizeCell(row[0]));
   while (rows.length > 0 && !rows.at(-1)) rows.pop();
+  const lastContentRow = headerRowNumber + rows.length;
+  const targetColumns = headers
+    .map((header, index) => ({ index, tag: getLanguageTag(header) }))
+    .filter((column) => column.tag && column.tag.toLowerCase() !== "zh-hans");
+  const currentFullRows = rows.length > 0
+    ? await readRowsInChunks(
+        spreadsheetToken,
+        sheetId,
+        headerRowNumber + 1,
+        lastContentRow,
+        "A",
+        columnIndexToLetters(Math.max(headers.length - 1, sourceColumn)),
+        200,
+      )
+    : [];
+  const missingTranslationRows = currentFullRows.flatMap((row, index) => {
+    const currentText = normalizeCell(row[sourceColumn]);
+    if (!containsChineseText(currentText)) return [];
+    const blankTargets = targetColumns.filter((column) =>
+      !normalizeCell(row[column.index]),
+    );
+    if (blankTargets.length === 0) return [];
+    return [{
+      type: "missing",
+      rowNumber: headerRowNumber + 1 + index,
+      previousText: currentText,
+      currentText,
+      blankTargetCount: blankTargets.length,
+      blankTargetTags: blankTargets.map((column) => column.tag),
+    }];
+  });
   const snapshot = sheetSnapshotStore.get(spreadsheetToken, sheetId);
   const metadataChanged = snapshot && (
     snapshot.headerRowNumber !== headerRowNumber || snapshot.sourceColumn !== sourceColumn
   );
-  const changes = !snapshot || metadataChanged
+  const sourceChanges = !snapshot || metadataChanged
     ? []
     : diffSheetRows(snapshot.rows ?? [], rows, headerRowNumber + 1)
       .filter((change) => containsChineseText(change.currentText));
+  const changedRows = new Set(sourceChanges.map((change) => change.rowNumber));
+  const changes = [
+    ...sourceChanges,
+    ...missingTranslationRows.filter((change) => !changedRows.has(change.rowNumber)),
+  ].sort((a, b) => a.rowNumber - b.rowNumber);
   const removedChineseCount = snapshot && !metadataChanged
     ? countRemovedChineseRows(snapshot.rows ?? [], rows)
     : 0;
@@ -1679,6 +1715,7 @@ async function prepareSheetSnapshotCheck(spreadsheetCommand) {
     snapshot,
     metadataChanged,
     changes,
+    missingTranslationRows,
     removedChineseCount,
     rowStructureChanged,
   };
@@ -1692,6 +1729,8 @@ function snapshotCheckSignature(task) {
       change.rowNumber,
       change.previousText,
       change.currentText,
+      change.blankTargetCount ?? 0,
+      change.blankTargetTags ?? [],
     ]),
   });
 }
@@ -1801,7 +1840,9 @@ async function handleSpreadsheetLinkMessage(messageId, actorKey, spreadsheetComm
 function buildSnapshotChangeLines(changes) {
   return changes.map((change) => change.type === "added"
     ? `• 新增｜第${change.rowNumber}行：${change.currentText}`
-    : `• 修改｜第${change.rowNumber}行：${change.previousText} → ${change.currentText}`);
+    : change.type === "missing"
+      ? `• 译文缺失｜第${change.rowNumber}行：缺少 ${change.blankTargetCount}个语种｜${change.currentText}`
+      : `• 修改｜第${change.rowNumber}行：${change.previousText} → ${change.currentText}`);
 }
 
 function splitTextChunks(lines, maxLength = 12000) {
@@ -1846,12 +1887,16 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
           "",
           task.metadataChanged
             ? "检测到语言表头结构发生变化，系统已自动保存当前版本。下次检查时会直接识别新增和修改内容。"
-            : "这是系统首次处理该 Sheet，当前版本已自动保存。以后修改内容后再次检查，系统会直接识别并展示新增和修改内容。",
+            : task.missingTranslationRows.length > 0
+              ? `当前版本已自动保存，同时发现 ${task.missingTranslationRows.length}行存在译文缺失，将继续展示待翻译内容。`
+              : "这是系统首次处理该 Sheet，当前版本已自动保存。以后修改内容后再次检查，系统会直接识别并展示新增和修改内容。",
         ].join("\n"),
         { template: "green" },
       ),
     );
-    return;
+    if (task.missingTranslationRows.length === 0) return;
+    task.snapshot = createSnapshotRecord(task);
+    task.metadataChanged = false;
   }
   if (task.changes.length === 0) {
     if (task.rowStructureChanged) {
@@ -1891,7 +1936,8 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
     expiresAt: Date.now() + CONFIRMATION_TTL_MS,
   });
   const addedCount = task.changes.filter((change) => change.type === "added").length;
-  const modifiedCount = task.changes.length - addedCount;
+  const modifiedCount = task.changes.filter((change) => change.type === "modified").length;
+  const missingCount = task.changes.filter((change) => change.type === "missing").length;
   const chunks = splitTextChunks(buildSnapshotChangeLines(task.changes));
   for (let index = 0; index < chunks.length; index += 1) {
     await replyWithCard(
@@ -1899,7 +1945,9 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
       buildMessageCard(
         `Sheet 更新内容${chunks.length > 1 ? `（${index + 1}/${chunks.length}）` : ""}`,
         [
-          index === 0 ? `Sheet：**${task.sheet.title ?? task.sheetId}**\n新增 ${addedCount}行，修改 ${modifiedCount}行。\n` : "",
+          index === 0
+            ? `Sheet：**${task.sheet.title ?? task.sheetId}**\n新增 ${addedCount}行，修改 ${modifiedCount}行，译文缺失 ${missingCount}行。\n`
+            : "",
           index === 0 && task.removedChineseCount > 0
             ? `另检测到删除 ${task.removedChineseCount}条，按规则忽略且不翻译。\n`
             : "",
@@ -1913,7 +1961,7 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
     messageId,
     buildMessageCard(
       "确认翻译 Sheet 差异",
-      `共检测到 **${task.changes.length}行**变化。\n新增行仅填空白译文；修改行将覆盖已有译文。`,
+      `共检测到 **${task.changes.length}行**需要处理。\n新增和译文缺失行仅填空白目标列；修改行将覆盖已有译文。`,
       {
         template: "orange",
         buttons: [
@@ -1937,7 +1985,9 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
 function groupSnapshotRanges(changes) {
   const groups = [];
   for (const change of [...changes].sort((a, b) => a.rowNumber - b.rowNumber)) {
-    const mode = change.type === "added" ? "fill_blank" : "overwrite";
+    const mode = change.type === "added" || change.type === "missing"
+      ? "fill_blank"
+      : "overwrite";
     const current = groups.at(-1);
     if (current && current.mode === mode && current.endRow + 1 === change.rowNumber) {
       current.endRow = change.rowNumber;
