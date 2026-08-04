@@ -49,6 +49,11 @@ const pendingConfirmations = new Map();
 const pendingFullTableTranslations = new Map();
 const pendingAutoTranslations = new Map();
 const pendingEditWindows = new Map();
+let lastWebhookDiagnostic = {
+  receivedAt: null,
+  kind: null,
+  result: null,
+};
 const lastFormStateByActor = new Map();
 const lastWelcomeAtByChat = new Map();
 const MAX_COLUMNS_RANGE = "CV";
@@ -2755,18 +2760,46 @@ async function readJsonRequest(request) {
 
 async function handleFeishuWebhook(request, response) {
   const data = await readJsonRequest(request);
+  lastWebhookDiagnostic = {
+    receivedAt: new Date().toISOString(),
+    kind: data?.encrypt
+      ? "encrypted"
+      : data?.type === "url_verification"
+        ? "url_verification"
+        : "event",
+    result: "received",
+  };
+  console.log(`[Webhook] 收到 ${lastWebhookDiagnostic.kind} 请求`);
+  if (data?.encrypt) {
+    if (!encryptKey) {
+      lastWebhookDiagnostic.result = "missing_encrypt_key";
+      response.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ error: "missing encrypt key" }));
+      return;
+    }
+    const generated = Lark.generateChallenge(data, { encryptKey });
+    if (generated.isChallenge) {
+      lastWebhookDiagnostic.result = "encrypted_challenge_returned";
+      response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify(generated.challenge));
+      return;
+    }
+  }
   if (data?.type === "url_verification" && data?.challenge) {
     if (verificationToken && data.token !== verificationToken) {
+      lastWebhookDiagnostic.result = "verification_token_mismatch";
       response.writeHead(403, { "content-type": "application/json; charset=utf-8" });
       response.end(JSON.stringify({ error: "verification token mismatch" }));
       return;
     }
+    lastWebhookDiagnostic.result = "challenge_returned";
     response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
     response.end(JSON.stringify({ challenge: data.challenge }));
     return;
   }
   const requestData = Object.assign(Object.create({ headers: request.headers }), data);
   const result = await eventDispatcher.invoke(requestData);
+  lastWebhookDiagnostic.result = "event_dispatched";
   response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(result ?? {}));
 }
@@ -2774,7 +2807,7 @@ async function handleFeishuWebhook(request, response) {
 const server = createServer((request, response) => {
   if (request.url === "/health") {
     response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
-    response.end(JSON.stringify({ ok: true }));
+    response.end(JSON.stringify({ ok: true, webhook: lastWebhookDiagnostic }));
     return;
   }
   if (request.url === "/feishu/events" && request.method === "POST") {
