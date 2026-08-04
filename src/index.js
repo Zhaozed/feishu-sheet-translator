@@ -234,7 +234,7 @@ function buildUsageGuideCard() {
       "3. 已将“产研翻译小助手”添加为表格应用，并授予 **编辑权限**。",
       "",
       "**模式一：检查并翻译更新**",
-      "把机器人添加为表格应用后，直接把飞书自动发送的表格链接留在会话中即可。",
+      "把机器人添加为表格应用后，可直接发送刚修改的 Sheet 链接，也可以点击下方“检查并翻译更新”。",
       "1. 首次收到文档链接后，机器人自动记录整份文档的所有可处理 Sheet。",
       "2. 以后发送刚修改的 Sheet 链接，机器人直接找出新增和修改内容。",
       "3. 确认后仅翻译变化内容；无需填写 Sheet 名称或起止行号。",
@@ -254,8 +254,9 @@ function buildUsageGuideCard() {
     {
       template: "turquoise",
       buttons: [
-        { name: "open_new_locale_translation", text: "新增语种翻译", type: "primary" },
-        { name: "open_existing_translation", text: "按行号手动翻译" },
+        { name: "open_snapshot_check", text: "检查并翻译更新", type: "primary" },
+        { name: "open_existing_translation", text: "按行号翻译" },
+        { name: "open_new_locale_translation", text: "新增语种翻译" },
       ],
     },
   );
