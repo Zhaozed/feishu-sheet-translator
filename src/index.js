@@ -226,30 +226,29 @@ function buildUsageGuideCard() {
   return buildMessageCard(
     "产研翻译小助手｜使用说明",
     [
-      "我可以读取飞书电子表格中的简体中文，自动识别语言列，并完成翻译回填。请选择下方一种翻译模式。",
+      "我会对比 Sheet 的上次处理版本，找出简体中文的新增和修改，并在你确认后批量翻译。",
       "",
-      "**开始前请确认**",
-      "1. **简体中文列**已有待翻译内容。",
-      "2. 表头包含 **“简体中文”** 和至少一个 **目标语言列**。",
-      "3. 已将“产研翻译小助手”添加为表格应用，并授予 **编辑权限**。",
+      "**一、先授权一次**",
+      "1. 打开目标电子表格，在右上角菜单中选择 **添加文档应用**。",
+      "2. 添加“产研翻译小助手”，并授予 **编辑权限**。",
+      "3. 飞书会向机器人发送授权链接；机器人收到后自动扫描并记录该文档所有可处理 Sheet。",
+      "4. 如果没有收到“已自动记录整份文档”，直接发送任意 Sheet 链接也可以完成初始化。",
       "",
-      "**模式一：检查并翻译更新**",
-      "把机器人添加为表格应用后，可直接发送刚修改的 Sheet 链接，也可以点击下方“检查并翻译更新”。",
-      "1. 首次收到文档链接后，机器人自动记录整份文档的所有可处理 Sheet。",
-      "2. 以后发送刚修改的 Sheet 链接，机器人直接找出新增和修改内容。",
-      "3. 确认后仅翻译变化内容；无需填写 Sheet 名称或起止行号。",
+      "**二、日常更新已有翻译**",
+      "修改某个 Sheet 的 **简体中文 / zh-Hans** 列后：",
+      "1. 直接发送该 Sheet 的链接，或点击下方 **检查并翻译更新** 手动粘贴链接。",
+      "2. 机器人展示全部新增和修改；确认后合并为一个批次翻译。",
+      "3. 翻译全部成功后，系统自动保存本次版本。删除内容不会触发翻译。",
       "",
-      "**模式二：新增语种翻译**",
-      "适合在整个文档的可处理 Sheet 末尾新增一个语言列，并翻译全部有效简体中文。",
-      "1. 粘贴表格链接。",
-      "2. 填写语言名称，例如“泰语”或“Thai”。",
-      "3. 填写 **BCP 47 语言标签**，例如 `th`、`fr-CA`、`zh-Hant`。",
-      "4. 检查任务规模；确认后，机器人新增语言列并回填全部有效内容。",
+      "**三、“自动”的边界**",
+      "• 自动完成的是：授权链接初始化、差异识别、批量翻译和版本保存。",
+      "• 机器人不会实时监听表格；修改后仍需发送 Sheet 链接或点击手动检查按钮。",
+      "• 首次记录只能保存当时内容，无法识别首次记录之前发生的修改。",
+      "• 只检查链接指定的一个 Sheet；只处理含中文的简体中文列，删除及其他列变化会忽略。",
       "",
-      "**安全边界**",
-      "• **简体中文为空**的行不会翻译。",
-      "• 机器人**不会修改简体中文列和其他业务字段**。",
-      "• 网络中断时会自动重试；如有部分翻译失败，结果卡会明确显示**成功与失败数量**。",
+      "**其他入口**",
+      "• **按行号翻译**：自动识别异常时的兜底。",
+      "• **新增语种翻译**：低频操作，手动扫描整份文档并新增语言列。",
     ].join("\n"),
     {
       template: "turquoise",
@@ -1792,7 +1791,6 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
       createSnapshotRecord(task),
     );
     await sheetSnapshotStore.save();
-    pendingSnapshotTasks.delete(actorKey);
     await replyWithCard(
       messageId,
       buildMessageCard(
@@ -1811,7 +1809,6 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
     return;
   }
   if (task.changes.length === 0) {
-    pendingSnapshotTasks.delete(actorKey);
     await replyWithCard(
       messageId,
       buildMessageCard(
@@ -1827,8 +1824,10 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
     );
     return;
   }
-  pendingSnapshotTasks.set(actorKey, {
+  const snapshotTaskId = randomUUID();
+  pendingSnapshotTasks.set(snapshotTaskId, {
     ...task,
+    actorKey,
     expiresAt: Date.now() + CONFIRMATION_TTL_MS,
   });
   const addedCount = task.changes.filter((change) => change.type === "added").length;
@@ -1855,8 +1854,17 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
       {
         template: "orange",
         buttons: [
-          { name: "translate_snapshot_all", text: "翻译全部差异", type: "primary" },
-          { name: "cancel_snapshot_task", text: "暂不处理" },
+          {
+            name: "translate_snapshot_all",
+            text: "翻译全部差异",
+            type: "primary",
+            value: { snapshot_task_id: snapshotTaskId },
+          },
+          {
+            name: "cancel_snapshot_task",
+            text: "暂不处理",
+            value: { snapshot_task_id: snapshotTaskId },
+          },
         ],
       },
     ),
@@ -2439,14 +2447,19 @@ async function handleCardAction(data) {
   }
 
   if (["translate_snapshot_all", "cancel_snapshot_task"].includes(actionName)) {
-    const pending = pendingSnapshotTasks.get(actorKey);
+    const snapshotTaskId = normalizeCell(getCardActionValue(action).snapshot_task_id);
+    const pending = pendingSnapshotTasks.get(snapshotTaskId);
     if (!pending || pending.expiresAt < Date.now()) {
-      pendingSnapshotTasks.delete(actorKey);
+      if (snapshotTaskId) pendingSnapshotTasks.delete(snapshotTaskId);
       await replyWithErrorCard(messageId, "Sheet 更新任务已失效，请重新检查。");
       return;
     }
+    if (pending.actorKey !== actorKey) {
+      await replyWithErrorCard(messageId, "该确认任务不属于当前用户，请重新检查 Sheet 更新。");
+      return;
+    }
     if (actionName === "cancel_snapshot_task") {
-      pendingSnapshotTasks.delete(actorKey);
+      pendingSnapshotTasks.delete(snapshotTaskId);
       await replyWithCard(
         messageId,
         buildMessageCard("已暂不处理", "本次没有翻译，检测到的更新会在下次检查时再次显示。", { template: "grey" }),
@@ -2455,13 +2468,10 @@ async function handleCardAction(data) {
     }
     try {
       const latest = await prepareSheetSnapshotCheck(pending.spreadsheetCommand);
-      const expectedByRow = new Map(pending.changes.map((change) => [change.rowNumber, change.currentText]));
-      const safeChanges = latest.changes.filter(
-        (change) => expectedByRow.get(change.rowNumber) === change.currentText,
-      );
-      if (safeChanges.length !== pending.changes.length) {
+      if (snapshotCheckSignature(latest) !== snapshotCheckSignature(pending)) {
         throw new Error("确认前简体中文再次变化，已停止执行；请重新检查 Sheet 更新。");
       }
+      const safeChanges = latest.changes;
       const ranges = groupSnapshotRanges(safeChanges);
       await replyWithCard(
         messageId,
@@ -2499,7 +2509,7 @@ async function handleCardAction(data) {
         createSnapshotRecord(latest),
       );
       await sheetSnapshotStore.save();
-      pendingSnapshotTasks.delete(actorKey);
+      pendingSnapshotTasks.delete(snapshotTaskId);
       await replyWithCard(
         messageId,
         buildMessageCard(

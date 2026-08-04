@@ -5,6 +5,7 @@ export class SheetSnapshotStore {
   constructor(path) {
     this.path = path;
     this.data = { version: 1, sheets: {} };
+    this.savePromise = Promise.resolve();
   }
 
   async load() {
@@ -36,10 +37,13 @@ export class SheetSnapshotStore {
   }
 
   async save() {
-    await mkdir(dirname(this.path), { recursive: true });
-    const temporaryPath = `${this.path}.tmp`;
-    await writeFile(temporaryPath, `${JSON.stringify(this.data, null, 2)}\n`, "utf8");
-    await rename(temporaryPath, this.path);
+    this.savePromise = this.savePromise.catch(() => {}).then(async () => {
+      await mkdir(dirname(this.path), { recursive: true });
+      const temporaryPath = `${this.path}.tmp`;
+      await writeFile(temporaryPath, `${JSON.stringify(this.data, null, 2)}\n`, "utf8");
+      await rename(temporaryPath, this.path);
+    });
+    return this.savePromise;
   }
 }
 
@@ -96,6 +100,80 @@ function uniqueAnchors(previousRows, currentRows) {
   return anchors.reverse();
 }
 
+function normalizedTextDistance(left, right) {
+  const a = Array.from(left.slice(0, 200));
+  const b = Array.from(right.slice(0, 200));
+  if (a.length === 0 || b.length === 0) return a.length === b.length ? 0 : 1;
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let row = 1; row <= a.length; row += 1) {
+    const current = [row];
+    for (let column = 1; column <= b.length; column += 1) {
+      current[column] = Math.min(
+        current[column - 1] + 1,
+        previous[column] + 1,
+        previous[column - 1] + (a[row - 1] === b[column - 1] ? 0 : 1),
+      );
+    }
+    previous = current;
+  }
+  return previous[b.length] / Math.max(a.length, b.length);
+}
+
+function alignSegment(oldSegment, newSegment) {
+  if (oldSegment.length * newSegment.length > 10000) return null;
+  const gapCost = 0.7;
+  const costs = Array.from(
+    { length: oldSegment.length + 1 },
+    () => Array(newSegment.length + 1).fill(0),
+  );
+  const moves = Array.from(
+    { length: oldSegment.length + 1 },
+    () => Array(newSegment.length + 1).fill(""),
+  );
+  for (let row = 1; row <= oldSegment.length; row += 1) {
+    costs[row][0] = row * gapCost;
+    moves[row][0] = "delete";
+  }
+  for (let column = 1; column <= newSegment.length; column += 1) {
+    costs[0][column] = column * gapCost;
+    moves[0][column] = "insert";
+  }
+  for (let row = 1; row <= oldSegment.length; row += 1) {
+    for (let column = 1; column <= newSegment.length; column += 1) {
+      const options = [
+        {
+          cost: costs[row - 1][column - 1] + normalizedTextDistance(
+            oldSegment[row - 1],
+            newSegment[column - 1],
+          ),
+          move: "match",
+        },
+        { cost: costs[row - 1][column] + gapCost, move: "delete" },
+        { cost: costs[row][column - 1] + gapCost, move: "insert" },
+      ].sort((a, b) => a.cost - b.cost);
+      costs[row][column] = options[0].cost;
+      moves[row][column] = options[0].move;
+    }
+  }
+  const aligned = [];
+  let row = oldSegment.length;
+  let column = newSegment.length;
+  while (row > 0 || column > 0) {
+    const move = moves[row][column];
+    if (move === "match") {
+      aligned.push({ oldIndex: row - 1, newIndex: column - 1 });
+      row -= 1;
+      column -= 1;
+    } else if (move === "delete") {
+      row -= 1;
+    } else {
+      aligned.push({ oldIndex: null, newIndex: column - 1 });
+      column -= 1;
+    }
+  }
+  return aligned.reverse();
+}
+
 function diffSegment(previousRows, currentRows, oldStart, oldEnd, newStart, newEnd, baseRow) {
   const changes = [];
   const oldSegment = previousRows.slice(oldStart, oldEnd);
@@ -110,6 +188,21 @@ function diffSegment(previousRows, currentRows, oldStart, oldEnd, newStart, newE
   ) suffix += 1;
   const oldMiddle = oldSegment.slice(prefix, oldSegment.length - suffix || undefined);
   const newMiddle = newSegment.slice(prefix, newSegment.length - suffix || undefined);
+  const aligned = alignSegment(oldMiddle, newMiddle);
+  if (aligned) {
+    for (const pair of aligned) {
+      const previousText = pair.oldIndex === null ? "" : oldMiddle[pair.oldIndex];
+      const currentText = newMiddle[pair.newIndex];
+      if (!currentText || currentText === previousText) continue;
+      changes.push({
+        type: previousText ? "modified" : "added",
+        rowNumber: baseRow + newStart + prefix + pair.newIndex,
+        previousText,
+        currentText,
+      });
+    }
+    return changes;
+  }
   const pairedLength = Math.min(oldMiddle.length, newMiddle.length);
   for (let index = 0; index < pairedLength; index += 1) {
     const previousText = oldMiddle[index];
