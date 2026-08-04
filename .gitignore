@@ -2,4 +2,3 @@ node_modules/
 .env
 npm-debug.log*
 .DS_Store
-data/auto-workflow-state.json
