@@ -2747,9 +2747,30 @@ const eventDispatcher = new Lark.EventDispatcher({
   },
 });
 
-const webhookHandler = Lark.adaptDefault("/feishu/events", eventDispatcher, {
-  autoChallenge: Boolean(encryptKey),
-});
+async function readJsonRequest(request) {
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+}
+
+async function handleFeishuWebhook(request, response) {
+  const data = await readJsonRequest(request);
+  if (data?.type === "url_verification" && data?.challenge) {
+    if (verificationToken && data.token !== verificationToken) {
+      response.writeHead(403, { "content-type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ error: "verification token mismatch" }));
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    response.end(JSON.stringify({ challenge: data.challenge }));
+    return;
+  }
+  const requestData = Object.assign(Object.create({ headers: request.headers }), data);
+  const result = await eventDispatcher.invoke(requestData);
+  response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+  response.end(JSON.stringify(result ?? {}));
+}
+
 const server = createServer((request, response) => {
   if (request.url === "/health") {
     response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
@@ -2757,7 +2778,7 @@ const server = createServer((request, response) => {
     return;
   }
   if (request.url === "/feishu/events" && request.method === "POST") {
-    void webhookHandler(request, response).catch((error) => {
+    void handleFeishuWebhook(request, response).catch((error) => {
       console.error("[Webhook 处理失败]", formatFeishuError(error));
       if (!response.headersSent) response.writeHead(500);
       response.end("error");
