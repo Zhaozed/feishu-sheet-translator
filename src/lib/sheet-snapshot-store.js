@@ -21,6 +21,12 @@ export class SheetSnapshotStore {
     return this.data.sheets[`${spreadsheetToken}:${sheetId}`];
   }
 
+  hasSpreadsheet(spreadsheetToken) {
+    return Object.keys(this.data.sheets).some((key) =>
+      key.startsWith(`${spreadsheetToken}:`),
+    );
+  }
+
   set(spreadsheetToken, sheetId, snapshot) {
     this.data.sheets[`${spreadsheetToken}:${sheetId}`] = snapshot;
   }

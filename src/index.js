@@ -148,6 +148,35 @@ function readText(content) {
   }
 }
 
+function readMessageContent(content) {
+  try {
+    const parsed = JSON.parse(content ?? "{}");
+    const strings = [];
+    const visit = (value) => {
+      if (typeof value === "string") strings.push(value);
+      else if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object") Object.values(value).forEach(visit);
+    };
+    visit(parsed);
+    return strings.join("\n").trim();
+  } catch {
+    return String(content ?? "").trim();
+  }
+}
+
+function findSpreadsheetLink(text) {
+  const matches = String(text ?? "").match(/https?:\/\/[^\s<>"']+/gi) ?? [];
+  for (const match of matches) {
+    const candidate = match.replace(/[),，。；;！!？?]+$/u, "");
+    try {
+      return parseSpreadsheetUrl(candidate);
+    } catch {
+      // 继续检查消息中的其他链接。
+    }
+  }
+  return null;
+}
+
 function isTransientNetworkError(error) {
   const message = error instanceof Error ? error.message : String(error);
   return /ECONNRESET|ETIMEDOUT|ECONNREFUSED|socket hang up|network error|fetch failed|before secure TLS connection was established|502|503|504/i.test(
@@ -204,11 +233,10 @@ function buildUsageGuideCard() {
       "3. 已将“产研翻译小助手”添加为表格应用，并授予 **编辑权限**。",
       "",
       "**模式一：检查并翻译更新**",
-      "在刚修改的 Sheet 中复制链接，机器人自动对比上次处理版本，找出新增和修改行。",
-      "1. 链接必须包含 `sheet=` 参数。",
-      "2. 系统自动保存上次处理版本，用户无需管理快照。",
-      "3. 检查后展示完整差异，确认后仅翻译新增和修改内容。",
-      "4. 新增行默认仅填空白；修改行默认覆盖旧译文。",
+      "把机器人添加为表格应用后，直接把飞书自动发送的表格链接留在会话中即可。",
+      "1. 首次收到文档链接后，机器人自动记录整份文档的所有可处理 Sheet。",
+      "2. 以后发送刚修改的 Sheet 链接，机器人直接找出新增和修改内容。",
+      "3. 确认后仅翻译变化内容；无需填写 Sheet 名称或起止行号。",
       "",
       "**模式二：新增语种翻译**",
       "适合在整个文档的可处理 Sheet 末尾新增一个语言列，并翻译全部有效简体中文。",
@@ -225,8 +253,7 @@ function buildUsageGuideCard() {
     {
       template: "turquoise",
       buttons: [
-        { name: "open_snapshot_check", text: "检查并翻译更新", type: "primary" },
-        { name: "open_new_locale_translation", text: "新增语种翻译" },
+        { name: "open_new_locale_translation", text: "新增语种翻译", type: "primary" },
         { name: "open_existing_translation", text: "按行号手动翻译" },
       ],
     },
@@ -1623,6 +1650,77 @@ async function prepareSheetSnapshotCheck(spreadsheetCommand) {
   };
 }
 
+async function initializeDocumentSnapshots(spreadsheetCommand) {
+  const spreadsheetToken = await resolveSpreadsheetToken(
+    spreadsheetCommand.resourceType,
+    spreadsheetCommand.resourceToken,
+  );
+  const sheets = await querySheets(spreadsheetToken);
+  const results = await mapWithConcurrency(
+    sheets,
+    SHEET_SCAN_CONCURRENCY,
+    async (sheet) => {
+      if (sheetSnapshotStore.get(spreadsheetToken, sheet.sheet_id)) {
+        return { status: "existing", sheet };
+      }
+      try {
+        const task = await prepareSheetSnapshotCheck({
+          ...spreadsheetCommand,
+          requestedSheetId: sheet.sheet_id,
+        });
+        sheetSnapshotStore.set(
+          spreadsheetToken,
+          sheet.sheet_id,
+          createSnapshotRecord(task),
+        );
+        return { status: "recorded", sheet, task };
+      } catch (error) {
+        return { status: "skipped", sheet, reason: formatFeishuError(error) };
+      }
+    },
+  );
+  if (results.some((result) => result.status === "recorded")) {
+    await sheetSnapshotStore.save();
+  }
+  return { spreadsheetToken, sheets, results };
+}
+
+async function handleSpreadsheetLinkMessage(messageId, actorKey, spreadsheetCommand) {
+  const spreadsheetToken = await resolveSpreadsheetToken(
+    spreadsheetCommand.resourceType,
+    spreadsheetCommand.resourceToken,
+  );
+  const wasManaged = sheetSnapshotStore.hasSpreadsheet(spreadsheetToken);
+  const initialized = await initializeDocumentSnapshots(spreadsheetCommand);
+  if (!wasManaged) {
+    const recorded = initialized.results.filter((result) => result.status === "recorded");
+    const skipped = initialized.results.filter((result) => result.status === "skipped");
+    await replyWithCard(
+      messageId,
+      buildMessageCard(
+        recorded.length > 0 ? "已自动记录整份文档" : "暂未找到可记录的 Sheet",
+        [
+          `扫描 Sheet：${initialized.sheets.length}个`,
+          `已记录：${recorded.length}个`,
+          `跳过：${skipped.length}个`,
+          "",
+          "以后修改简体中文后，把刚修改的 Sheet 链接发给我，我会直接展示新增和修改内容。",
+        ].join("\n"),
+        { template: recorded.length > 0 && !skipped.length ? "green" : "orange" },
+      ),
+    );
+    return;
+  }
+  if (!spreadsheetCommand.requestedSheetId) {
+    throw new Error("该文档已经开始记录。请从刚修改的 Sheet 中复制包含 sheet= 的链接发给我。");
+  }
+  await showSheetSnapshotResult(
+    messageId,
+    actorKey,
+    await prepareSheetSnapshotCheck(spreadsheetCommand),
+  );
+}
+
 function buildSnapshotChangeLines(changes) {
   return changes.map((change) => change.type === "added"
     ? `• 新增｜第${change.rowNumber}行：${change.currentText}`
@@ -2136,6 +2234,16 @@ async function executeFullTableTranslation(messageId, taskInput) {
 }
 
 async function handleTextMessage(messageId, actorKey, text) {
+  const spreadsheetLink = findSpreadsheetLink(text);
+  if (spreadsheetLink && !/^翻译(?:\s|：|:)/.test(text)) {
+    try {
+      await handleSpreadsheetLinkMessage(messageId, actorKey, spreadsheetLink);
+    } catch (error) {
+      console.error("[自动处理表格链接失败]", formatFeishuError(error));
+      await replyWithErrorCard(messageId, error, spreadsheetLink);
+    }
+    return;
+  }
   if (/帮助|使用说明|说明书|怎么用|如何使用|使用方法/i.test(text)) {
     await replyWithHelp(messageId);
     return;
@@ -2615,15 +2723,16 @@ const eventDispatcher = new Lark.EventDispatcher({}).register({
       processedMessageIds.add(messageId);
     }
 
-    if (message.message_type !== "text") {
+    const text = message.message_type === "text"
+      ? readText(message.content)
+      : readMessageContent(message.content);
+    const actorKey =
+      data?.sender?.sender_id?.open_id ?? message.chat_id ?? messageId;
+    console.log(`[收到消息] ${messageId} (${message.message_type}): ${text}`);
+    if (!text) {
       await replyWithModeSelection(messageId);
       return;
     }
-
-    const text = readText(message.content);
-    const actorKey =
-      data?.sender?.sender_id?.open_id ?? message.chat_id ?? messageId;
-    console.log(`[收到消息] ${messageId}: ${text}`);
     void handleTextMessage(messageId, actorKey, text).catch((error) => {
       console.error("[消息处理失败]", error);
     });
