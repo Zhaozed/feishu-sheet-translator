@@ -818,13 +818,25 @@ function parseSpreadsheetUrl(urlText) {
     throw new Error("链接必须是飞书电子表格或知识库链接（/sheets/ 或 /wiki/）。");
   }
 
+  const requestedSheetId =
+    url.searchParams.get("sheet") ??
+    url.searchParams.get("sheet_id") ??
+    undefined;
+  const isAuthorizationNotice = url.searchParams.get("from") === "auth_notice";
+  const documentUrl = new URL(url);
+  documentUrl.searchParams.delete("sheet");
+  documentUrl.searchParams.delete("sheet_id");
+  if (isAuthorizationNotice) {
+    documentUrl.searchParams.delete("from");
+    documentUrl.searchParams.delete("hash");
+  }
+
   return {
     resourceType: sheetsTokenMatch ? "sheet" : "wiki",
     resourceToken: (sheetsTokenMatch ?? wikiTokenMatch)[1],
-    requestedSheetId:
-      url.searchParams.get("sheet") ??
-      url.searchParams.get("sheet_id") ??
-      undefined,
+    requestedSheetId,
+    isAuthorizationNotice,
+    documentUrl: documentUrl.toString(),
     originalUrl: url.toString(),
   };
 }
@@ -1865,41 +1877,47 @@ async function handleSpreadsheetLinkMessage(messageId, actorKey, spreadsheetComm
     spreadsheetCommand.resourceToken,
   );
   const wasManaged = sheetSnapshotStore.hasSpreadsheet(spreadsheetToken);
+  const shouldInitializeDocument = spreadsheetCommand.isAuthorizationNotice || !wasManaged;
   await replyWithCard(
     messageId,
     buildMessageCard(
-      wasManaged ? "正在检查 Sheet 更新" : "正在初始化文档",
-      wasManaged
+      shouldInitializeDocument ? "正在初始化整份文档" : "正在检查 Sheet 更新",
+      !shouldInitializeDocument
         ? "⏳ 正在等待飞书同步最新内容并连续核对，通常需要 **10–20 秒**，请勿重复提交。"
         : "⏳ 正在扫描文档内所有 Sheet 并保存初始版本，通常需要 **10–60 秒**，请稍候。",
       { template: "blue" },
     ),
   );
   const initialized = await initializeDocumentSnapshots(spreadsheetCommand);
-  if (!wasManaged) {
+  if (shouldInitializeDocument) {
     const recorded = initialized.results.filter((result) => result.status === "recorded");
+    const existing = initialized.results.filter((result) => result.status === "existing");
     const skipped = initialized.results.filter((result) => result.status === "skipped");
+    const availableCount = recorded.length + existing.length;
     await replyWithCard(
       messageId,
       buildMessageCard(
-        recorded.length > 0 ? "首次使用：文档准备完成" : "暂未找到可记录的 Sheet",
+        availableCount > 0 ? "整份文档已准备完成" : "暂未找到可记录的 Sheet",
         [
           `扫描 Sheet：${initialized.sheets.length}个`,
-          `已记录：${recorded.length}个`,
+          `新建对比基准：${recorded.length}个`,
+          `已有对比基准：${existing.length}个`,
           `跳过：${skipped.length}个`,
           "",
-          recorded.length > 0
-            ? "由于此前没有历史版本，机器人只能先保存当前内容作为对比基准，无法识别这次授权前做过的修改，也不会自动翻译它们。"
+          availableCount > 0
+            ? recorded.length > 0
+              ? "机器人已按整份文档建立初始版本。新建基准的 Sheet 因为此前没有历史版本，无法识别授权前做过的修改，也不会自动翻译它们。"
+              : "这份文档此前已经建立过对比基准，本次授权不会覆盖已有历史版本。"
             : "机器人没有找到包含简体中文语言列、且当前有权读取的 Sheet。",
           "",
-          recorded.length > 0
+          availableCount > 0
             ? "以后修改简体中文后，把刚修改的 Sheet 链接发给我，我会展示需要翻译的行供你确认。"
             : "请打开目标 Sheet，确认表头和机器人权限后再试。",
         ].join("\n"),
         {
-          template: recorded.length > 0 && !skipped.length ? "blue" : "orange",
-          buttons: spreadsheetCommand.originalUrl
-            ? [{ text: "打开当前表格", url: spreadsheetCommand.originalUrl, type: "primary" }]
+          template: availableCount > 0 && !skipped.length ? "blue" : "orange",
+          buttons: spreadsheetCommand.documentUrl
+            ? [{ text: "打开整份表格", url: spreadsheetCommand.documentUrl, type: "primary" }]
             : [],
         },
       ),
