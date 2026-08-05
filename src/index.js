@@ -1878,6 +1878,39 @@ async function handleSpreadsheetLinkMessage(messageId, actorKey, spreadsheetComm
   );
   const wasManaged = sheetSnapshotStore.hasSpreadsheet(spreadsheetToken);
   const shouldInitializeDocument = spreadsheetCommand.isAuthorizationNotice || !wasManaged;
+  if (wasManaged && !spreadsheetCommand.requestedSheetId && !spreadsheetCommand.isAuthorizationNotice) {
+    await replyWithCard(
+      messageId,
+      buildMessageCard(
+        "当前文档已经授权",
+        [
+          "机器人已经可以访问这份文档，并已保存各 Sheet 的对比基准，无需重复授权。",
+          "",
+          "如果要检查文案更新，请打开刚修改的小 Sheet，再复制地址栏中包含 `sheet=` 的完整链接发给我。机器人只会检查该 Sheet。",
+        ].join("\n"),
+        {
+          template: "green",
+          buttons: [
+            {
+              text: "打开整份表格",
+              url: spreadsheetCommand.documentUrl,
+              type: "primary",
+            },
+            {
+              name: "open_snapshot_check",
+              text: "检查某个 Sheet",
+              value: {},
+            },
+            {
+              name: "open_help",
+              text: "查看使用说明",
+            },
+          ],
+        },
+      ),
+    );
+    return;
+  }
   await replyWithCard(
     messageId,
     buildMessageCard(
