@@ -647,10 +647,14 @@ function buildFormRecovery(command, recovery = {}) {
         : ""),
     language_name: recovery.language_name ?? "",
     language_tag: recovery.language_tag ?? "",
+    snapshot_task_id: recovery.snapshot_task_id ?? "",
   };
 }
 
 function recoveryActionName(recovery) {
+  if (recovery.mode === "snapshot" && recovery.snapshot_task_id) {
+    return "translate_snapshot_all";
+  }
   return recovery.mode === "existing"
     ? "resume_existing_translation"
     : recovery.mode === "snapshot"
@@ -737,6 +741,8 @@ async function replyWithErrorCard(messageId, error, command, recoveryInput) {
             name: recoveryActionName(recovery),
             text: isMissingSheetLink
               ? "重新选择 Sheet"
+              : recovery.snapshot_task_id
+                ? isNetworkError ? "重试翻译" : "继续翻译"
               : recovery.mode === "snapshot"
               ? "重新检查"
               : isNetworkError ? "重新发起" : "重新填写",
@@ -2960,6 +2966,7 @@ async function handleCardAction(data) {
       await replyWithErrorCard(messageId, error, pending.spreadsheetCommand, {
         mode: "snapshot",
         sheet_url: pending.spreadsheetCommand.originalUrl,
+        snapshot_task_id: snapshotTaskId,
       });
     }
     return;
