@@ -717,24 +717,35 @@ async function replyWithErrorCard(messageId, error, command, recoveryInput) {
     return;
   }
   const isNetworkError = isTransientNetworkError(error);
+  const errorText = formatFeishuError(error);
+  const isMissingSheetLink = /没有指定 Sheet|包含 sheet=/i.test(errorText);
   await replyWithCard(
     messageId,
     buildMessageCard(
-      isNetworkError ? "网络连接暂时不稳定" : "翻译任务未完成",
+      isNetworkError
+        ? "网络连接暂时不稳定"
+        : isMissingSheetLink ? "请选择需要检查的 Sheet" : "翻译任务未完成",
       isNetworkError
         ? "机器人连接翻译服务时网络中断，本次没有修改表格。\n\n请稍后重新发起任务。"
-        : `**原因**\n${formatFeishuError(error)}\n\n请检查填写内容后重新提交。`,
+        : isMissingSheetLink
+          ? "当前链接只指向整份文档，机器人无法确定你刚修改的是哪一个 Sheet。\n\n请点击“打开当前表格”，切换到刚修改的小 Sheet，再复制地址栏中包含 `sheet=` 的完整链接并重新检查。"
+          : `**原因**\n${errorText}\n\n请检查填写内容后重新提交。`,
       {
-        template: isNetworkError ? "orange" : "red",
+        template: isNetworkError || isMissingSheetLink ? "orange" : "red",
         buttons: [
           {
             name: recoveryActionName(recovery),
-            text: recovery.mode === "snapshot"
+            text: isMissingSheetLink
+              ? "重新选择 Sheet"
+              : recovery.mode === "snapshot"
               ? "重新检查"
               : isNetworkError ? "重新发起" : "重新填写",
             type: "primary",
             value: recovery,
           },
+          ...(recovery.sheet_url
+            ? [{ text: "打开当前表格", url: recovery.sheet_url }]
+            : []),
           ...(recovery.mode === "home"
             ? []
             : [{ name: "open_help", text: "查看使用说明" }]),
@@ -1871,15 +1882,26 @@ async function handleSpreadsheetLinkMessage(messageId, actorKey, spreadsheetComm
     await replyWithCard(
       messageId,
       buildMessageCard(
-        recorded.length > 0 ? "已自动记录整份文档" : "暂未找到可记录的 Sheet",
+        recorded.length > 0 ? "首次使用：文档准备完成" : "暂未找到可记录的 Sheet",
         [
           `扫描 Sheet：${initialized.sheets.length}个`,
           `已记录：${recorded.length}个`,
           `跳过：${skipped.length}个`,
           "",
-          "以后调整简体中文后，把刚处理的 Sheet 链接发给我，我会直接展示需要翻译的内容。",
+          recorded.length > 0
+            ? "由于此前没有历史版本，机器人只能先保存当前内容作为对比基准，无法识别这次授权前做过的修改，也不会自动翻译它们。"
+            : "机器人没有找到包含简体中文语言列、且当前有权读取的 Sheet。",
+          "",
+          recorded.length > 0
+            ? "以后修改简体中文后，把刚修改的 Sheet 链接发给我，我会展示需要翻译的行供你确认。"
+            : "请打开目标 Sheet，确认表头和机器人权限后再试。",
         ].join("\n"),
-        { template: recorded.length > 0 && !skipped.length ? "green" : "orange" },
+        {
+          template: recorded.length > 0 && !skipped.length ? "blue" : "orange",
+          buttons: spreadsheetCommand.originalUrl
+            ? [{ text: "打开当前表格", url: spreadsheetCommand.originalUrl, type: "primary" }]
+            : [],
+        },
       ),
     );
     return;
@@ -1952,18 +1974,43 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
     await replyWithCard(
       messageId,
       buildMessageCard(
-        task.metadataChanged ? "已重新开始记录 Sheet 更新" : "已开始记录 Sheet 更新",
+        task.metadataChanged ? "表格结构已变化，已更新对比基准" : "首次使用：已建立更新对比基准",
         [
           `Sheet：**${task.sheet.title ?? task.sheetId}**`,
           `当前简体中文：${task.rows.filter(containsChineseText).length}条`,
           "",
           task.metadataChanged
-            ? "检测到语言表头结构发生变化，系统已自动保存当前版本。下次检查时会直接识别需要翻译的内容。"
+            ? "检测到简体中文列或表头位置发生变化，旧版本已无法可靠比较，因此系统已将当前内容保存为新的对比基准。"
             : task.missingTranslationRows.length > 0
-              ? `当前版本已自动保存，同时发现 ${task.missingTranslationRows.length}行存在译文缺失，将继续展示待翻译内容。`
-              : "这是系统首次处理该 Sheet，当前版本已自动保存。以后调整内容后再次检查，系统会直接识别并展示需要翻译的内容。",
+              ? `这是机器人第一次处理该 Sheet。由于此前没有历史版本，无法判断你本次具体修改了哪些内容；当前内容已保存为对比基准。另发现 ${task.missingTranslationRows.length}行译文为空，接下来仍会展示并允许翻译。`
+              : "这是机器人第一次处理该 Sheet。由于此前没有历史版本可供比较，无法判断你在本次检查前修改了哪些内容，因此这一次不会生成更新翻译任务。当前内容已保存为对比基准；以后修改简体中文后再次检查，机器人就能识别需要翻译的行。",
+          "",
+          task.metadataChanged
+            ? "请继续编辑简体中文，完成后点击“重新检查”。本次结构变化前的修改不会生成更新翻译任务。"
+            : task.missingTranslationRows.length > 0
+              ? "请继续核对下一张确认卡；以后修改简体中文后，再点击“重新检查”即可。"
+              : "下一步：打开表格修改简体中文，保存后返回并点击“重新检查”。",
         ].join("\n"),
-        { template: "green" },
+        {
+          template: "blue",
+          buttons: [
+            {
+              text: "打开当前表格",
+              url: task.spreadsheetCommand.originalUrl,
+              type: "primary",
+            },
+            {
+              name: "retry_snapshot_check",
+              text: "重新检查",
+              value: { sheet_url: task.spreadsheetCommand.originalUrl },
+            },
+            {
+              name: "open_existing_translation",
+              text: "手动按行号翻译",
+              value: { sheet_url: task.spreadsheetCommand.originalUrl },
+            },
+          ],
+        },
       ),
     );
     if (task.missingTranslationRows.length === 0) return;
@@ -1995,6 +2042,13 @@ async function showSheetSnapshotResult(messageId, actorKey, task) {
             name: "retry_snapshot_check",
             text: "重新检查",
             type: "primary",
+            value: { sheet_url: task.spreadsheetCommand.originalUrl },
+          }, {
+            text: "打开当前表格",
+            url: task.spreadsheetCommand.originalUrl,
+          }, {
+            name: "open_existing_translation",
+            text: "手动按行号翻译",
             value: { sheet_url: task.spreadsheetCommand.originalUrl },
           }],
         },
