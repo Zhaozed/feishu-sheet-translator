@@ -1002,7 +1002,7 @@ function normalizeLanguageHeader(value) {
 function getLanguageTag(header) {
   const normalizedHeader = normalizeCell(header);
   const match = normalizedHeader.match(
-    /\(语言标签\s*([a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*)\)/i,
+    /\((?:语言标签\s*)?([a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*)\)/i,
   );
   if (match) {
     return match[1];
@@ -1022,7 +1022,7 @@ function getLanguageTag(header) {
 
 function getLanguageDisplayName(header, fallbackTag = "") {
   const displayName = normalizeCell(header)
-    .replace(/\(语言标签\s*[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*\)/i, "")
+    .replace(/\s*[-–—]?\s*\((?:语言标签\s*)?[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*\)/i, "")
     .trim();
   return displayName || fallbackTag;
 }
@@ -1608,7 +1608,7 @@ async function executeTranslationCommand(
 function inferLanguageHeaderStyle(headers) {
   const languageHeaders = headers.filter((header) => getLanguageTag(header));
   const taggedCount = languageHeaders.filter((header) =>
-    /\(语言标签\s*[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*\)/i.test(
+    /\((?:语言标签\s*)?[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*\)/i.test(
       normalizeCell(header),
     ),
   ).length;
