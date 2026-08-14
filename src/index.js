@@ -4,7 +4,12 @@ import OpenAI from "openai";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { getLanguageCellValue, isLanguageMetadataRow } from "./lib/language-metadata.js";
+import {
+  extractLanguageTagFromHeader,
+  getLanguageCellValue,
+  isLanguageMetadataRow,
+  isSourceLanguageTag,
+} from "./lib/language-metadata.js";
 import {
   diffSheetRecords,
   diffSheetRows,
@@ -78,6 +83,30 @@ const LANGUAGE_NAMES = {
   ru: "Russian",
   pt: "Portuguese",
   pl: "Polish",
+  tr: "Turkish",
+  th: "Thai",
+  hr: "Croatian",
+  sl: "Slovenian",
+  el: "Greek",
+  sv: "Swedish",
+  he: "Hebrew",
+  vi: "Vietnamese",
+  hi: "Hindi",
+  uk: "Ukrainian",
+  cs: "Czech",
+  da: "Danish",
+  fi: "Finnish",
+  ro: "Romanian",
+  sk: "Slovak",
+  bg: "Bulgarian",
+  hu: "Hungarian",
+  no: "Norwegian",
+  "zh": "Simplified Chinese",
+  "zh-hans": "Simplified Chinese",
+  "zh-tw": "Traditional Chinese",
+  "zh-hk": "Traditional Chinese (Hong Kong)",
+  "pt-br": "Brazilian Portuguese",
+  "pt-pt": "European Portuguese",
 };
 const PLAIN_LANGUAGE_HEADERS = new Map(
   Object.entries({
@@ -1013,26 +1042,51 @@ function getLanguageTag(header) {
   if (builtInTag) {
     return builtInTag;
   }
-  return customLanguageRegistry.find((item) =>
+  const customTag = customLanguageRegistry.find((item) =>
     (item.aliases ?? []).some(
       (alias) => normalizeLanguageHeader(alias) === normalizedAlias,
     ),
   )?.tag;
+  if (customTag) {
+    return customTag;
+  }
+
+  // Relaxed fallback: recognise language codes embedded as a suffix in
+  // headers such as `title_zh`, `value_en`, or `subtitle_pt_br`.
+  return extractLanguageTagFromHeader(normalizedHeader) ?? undefined;
 }
 
 function getLanguageDisplayName(header, fallbackTag = "") {
-  const displayName = normalizeCell(header)
-    .replace(/\s*[-–—]?\s*\((?:语言标签\s*)?[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*\)/i, "")
-    .trim();
-  return displayName || fallbackTag;
+  const normalizedHeader = normalizeCell(header);
+  const tagPattern = /\s*[-–—]?\s*\((?:语言标签\s*)?[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*\)/i;
+  const match = normalizedHeader.match(tagPattern);
+  if (match) {
+    const stripped = normalizedHeader.slice(0, match.index).trim();
+    if (stripped) return stripped;
+  }
+  const normalizedAlias = normalizeLanguageHeader(normalizedHeader);
+  if (PLAIN_LANGUAGE_HEADERS.has(normalizedAlias)) {
+    return normalizedHeader;
+  }
+  const custom = customLanguageRegistry.find((item) =>
+    (item.aliases ?? []).some(
+      (alias) => normalizeLanguageHeader(alias) === normalizedAlias,
+    ),
+  );
+  if (custom) {
+    return normalizedHeader;
+  }
+  // Suffix-style or bare-code header (title_en, zh): let translateText
+  // resolve a clean language name from the tag.
+  return "";
 }
 
 function findHeaderRow(rows) {
   for (let index = 0; index < rows.length; index += 1) {
     const headers = rows[index] ?? [];
     const tags = headers.map(getLanguageTag).filter(Boolean);
-    const hasSource = tags.some((tag) => tag.toLowerCase() === "zh-hans");
-    const hasTarget = tags.some((tag) => tag.toLowerCase() !== "zh-hans");
+    const hasSource = tags.some((tag) => isSourceLanguageTag(tag));
+    const hasTarget = tags.some((tag) => !isSourceLanguageTag(tag));
 
     if (hasSource && hasTarget) {
       return {
@@ -1043,16 +1097,16 @@ function findHeaderRow(rows) {
   }
 
   throw new Error(
-    `前${HEADER_SCAN_ROW_COUNT}行中未找到有效语言表头。表头需包含“简体中文”或“(语言标签zh-Hans)”，并至少包含一个目标语言列（如 English、French，或对应语言标签）。`,
+    `前${HEADER_SCAN_ROW_COUNT}行中未找到有效语言表头。表头需包含简体中文源语言列（如“简体中文”、“(语言标签zh-Hans)”或“title_zh”），并至少包含一个目标语言列（如 English、French，或 title_en、title_tr 等带语言代码后缀的列）。`,
   );
 }
 
 function analyzeRow(headers, row, rowNumber) {
-  const sourceColumn = headers.findIndex(
-    (header) => getLanguageTag(header)?.toLowerCase() === "zh-hans",
+  const sourceColumn = headers.findIndex((header) =>
+    isSourceLanguageTag(getLanguageTag(header)),
   );
   if (sourceColumn < 0) {
-    throw new Error("表头中没有找到“简体中文”或“(语言标签zh-Hans)”。");
+    throw new Error("表头中没有找到简体中文源语言列（如“简体中文”、“(语言标签zh-Hans)”或“title_zh”）。");
   }
 
   const sourceText = normalizeCell(row[sourceColumn]);
@@ -1069,7 +1123,7 @@ function analyzeRow(headers, row, rowNumber) {
     }))
     .filter(
       (column) =>
-        column.tag && column.tag.toLowerCase() !== "zh-hans",
+        column.tag && !isSourceLanguageTag(column.tag),
     );
 
   if (targets.length === 0) {
@@ -1678,8 +1732,8 @@ async function prepareSheetSnapshotCheck(spreadsheetCommand) {
     `${sheetId}!A1:${MAX_COLUMNS_RANGE}${HEADER_SCAN_ROW_COUNT}`,
   );
   const { headerRowNumber, headers } = findHeaderRow(headerRows);
-  const sourceColumn = headers.findIndex(
-    (header) => getLanguageTag(header)?.toLowerCase() === "zh-hans",
+  const sourceColumn = headers.findIndex((header) =>
+    isSourceLanguageTag(getLanguageTag(header)),
   );
   if (sourceColumn < 0) throw new Error("没有找到简体中文源语言列。");
   const configuredRowCount = sheet.grid_properties?.row_count ?? sheet.row_count ?? 5000;
@@ -1699,7 +1753,7 @@ async function prepareSheetSnapshotCheck(spreadsheetCommand) {
   const lastContentRow = headerRowNumber + rows.length;
   const targetColumns = headers
     .map((header, index) => ({ index, tag: getLanguageTag(header) }))
-    .filter((column) => column.tag && column.tag.toLowerCase() !== "zh-hans");
+    .filter((column) => column.tag && !isSourceLanguageTag(column.tag));
   const metadataColumns = headers
     .map((header, index) => ({ index, tag: getLanguageTag(header) }))
     .filter((column) => !column.tag && column.index !== sourceColumn);
@@ -2230,8 +2284,8 @@ async function prepareFullTableTranslation(
     `${sheetId}!A1:${MAX_COLUMNS_RANGE}${HEADER_SCAN_ROW_COUNT}`,
   );
   const { headerRowNumber, headers } = findHeaderRow(headerRows);
-  const sourceColumn = headers.findIndex(
-    (header) => getLanguageTag(header)?.toLowerCase() === "zh-hans",
+  const sourceColumn = headers.findIndex((header) =>
+    isSourceLanguageTag(getLanguageTag(header)),
   );
   if (sourceColumn < 0) {
     throw new Error("没有找到简体中文源语言列。");
@@ -2455,7 +2509,7 @@ async function executeSingleFullTableTranslation(messageId, taskInput, quiet = f
         tag: getLanguageTag(header),
         value: normalizeCell(row[index]),
       }))
-      .filter((item) => item.tag && item.tag.toLowerCase() !== "zh-hans")
+      .filter((item) => item.tag && !isSourceLanguageTag(item.tag))
       .map((item) => item.value);
     const sourceText = normalizeCell(row[task.sourceColumn]);
     return {
