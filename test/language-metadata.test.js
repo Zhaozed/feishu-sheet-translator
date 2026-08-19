@@ -4,6 +4,7 @@ import {
   buildLanguageHeader,
   extractLanguageTagFromHeader,
   getLanguageCellValue,
+  getLanguageSelfName,
   inferLanguageHeaderFormatter,
   isLanguageMetadataRow,
   isSourceLanguageTag,
@@ -135,4 +136,33 @@ test("按现有风格构造新语言表头", () => {
     "泰语(语言标签th)",
   );
   assert.equal(buildLanguageHeader("越南语", "vi", null), "越南语");
+});
+
+test("语言选择器键直接使用自名，不做模型翻译", () => {
+  const cases = {
+    rb_set_lan_en: "English",
+    rb_set_lan_zh: "简体中文",
+    rb_set_lan_fr: "Français",
+    rb_set_lan_de: "Deutsch",
+    rb_set_lan_es: "Español",
+    rb_set_lan_it: "Italiano",
+    rb_set_lan_ja: "Japanese",
+    rb_set_lan_nl: "Dutch",
+    rb_set_lan_ar: "العربية",
+    rb_set_lan_ko: "한국어",
+    rb_set_lan_zh_hant: null,
+    "rb_set_lan_zh-hant": "粵語",
+    rb_set_lan_ru: "Русский",
+    rb_set_lan_pt: "Português",
+    rb_set_lan_pl: "Polski",
+  };
+  for (const [key, expected] of Object.entries(cases)) {
+    assert.equal(getLanguageSelfName(key), expected, `${key} 应返回 ${expected}`);
+  }
+  assert.equal(getLanguageSelfName("RB_SET_LAN_FR"), "Français");
+  assert.equal(getLanguageSelfName("  rb_set_lan_ja  "), "Japanese");
+  assert.equal(getLanguageSelfName("name_i18n"), null);
+  assert.equal(getLanguageSelfName("desc_i18n"), null);
+  assert.equal(getLanguageSelfName(""), null);
+  assert.equal(getLanguageSelfName(null), null);
 });

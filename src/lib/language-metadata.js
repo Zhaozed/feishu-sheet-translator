@@ -173,3 +173,36 @@ export function buildLanguageHeader(languageName, languageTag, formatter) {
   const tag = String(languageTag ?? "").trim();
   return `${name}${formatter.separator}(${formatter.labeled ? "语言标签" : ""}${tag})`;
 }
+
+// Hard-coded self names for the language-picker keys (`rb_set_lan_*`). The
+// app ships these keys with the same autonym in every locale file, so the
+// target column must NOT be model-translated: `rb_set_lan_fr` is
+// `Français` in the English column too, `rb_set_lan_zh-hant` is `粵語`,
+// etc. Keys are lowercase; matching is case-insensitive.
+const RB_SET_LAN_SELF_NAMES = {
+  "rb_set_lan_ar": "العربية",
+  "rb_set_lan_de": "Deutsch",
+  "rb_set_lan_en": "English",
+  "rb_set_lan_es": "Español",
+  "rb_set_lan_fr": "Français",
+  "rb_set_lan_it": "Italiano",
+  "rb_set_lan_ja": "Japanese",
+  "rb_set_lan_ko": "한국어",
+  "rb_set_lan_nl": "Dutch",
+  "rb_set_lan_pl": "Polski",
+  "rb_set_lan_pt": "Português",
+  "rb_set_lan_ru": "Русский",
+  "rb_set_lan_zh": "简体中文",
+  "rb_set_lan_zh-hant": "粵語",
+};
+
+const RB_SET_LAN_KEY_PATTERN = /^rb_set_lan_[a-z0-9-]+$/i;
+
+// Return the fixed self-name for a `rb_set_lan_*` key (e.g.
+// `rb_set_lan_fr` -> `Français`), or null when the cell is not such a key.
+// The returned value is independent of the target language column.
+export function getLanguageSelfName(sourceKey) {
+  const key = String(sourceKey ?? "").trim();
+  if (!RB_SET_LAN_KEY_PATTERN.test(key)) return null;
+  return RB_SET_LAN_SELF_NAMES[key.toLowerCase()] ?? null;
+}

@@ -106,6 +106,10 @@
 - 纯名称格式：`简体中文`、`English`、`French`、`瑞典语`、`泰语`、`意大利语` 等。
 - 代码后缀格式：`title_zh`、`title_en`、`title_tr`、`subtitle_pt_br`、`name_ft` 等；单独的语言代码表头（`sv`、`tr`、`th`）也会按该语言识别。只要表头以 ISO 语言代码（`zh`、`en`、`tr`、`ja`、`ru`、`ko`、`ar`、`de`、`pl`、`pt`、`es`、`hr`、`sl`、`el`、`sv`、`he`、`it`、`fr`、`th` 等）作为后缀即可识别；`title_pt_br` 解析为 `pt-BR`，`title_ft` 解析为繁体中文，`title_zh` 解析为简体中文源语言列。
 
+## 语言选择器键（rb_set_lan_*）
+
+表格中语言选择器相关的行（`Json-Key`/`key`/`键`/`标识` 列的值为 `rb_set_lan_en`、`rb_set_lan_fr`、`rb_set_lan_zh-hant` 等）不走模型翻译，直接写入该语言的自名，且所有语种列的值一致：`rb_set_lan_fr` 任何语言列都写 `Français`，`rb_set_lan_zh-hant` 写 `粵語`，`rb_set_lan_zh` 写 `简体中文`。手动按行翻译和新增语种（整列回填/重译）两条路径都适用；没有 key 列的 Sheet 不受影响，仍按原文翻译。
+
 带标签格式按照 BCP 47 标签识别；纯名称格式按照完整语言名称或已登记的别名识别；代码后缀格式按常见 ISO 639-1 代码识别。为避免误判业务列，`_id`、`_no` 等常见后缀不会被当作语言代码（如 `timbre_id`、`seq_no`），如需翻译这类语种请改用纯名称或带标签格式。成功新增一种语言后，机器人会把该语言名称和标签记录在 `data/languages.json`，供后续识别同类纯名称表头使用。这是内部能力，不向用户提供独立的“添加语言配置”功能。
 
 ## 权限与失败处理

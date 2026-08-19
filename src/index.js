@@ -8,6 +8,7 @@ import {
   buildLanguageHeader,
   extractLanguageTagFromHeader,
   getLanguageCellValue,
+  getLanguageSelfName,
   inferLanguageHeaderFormatter,
   isLanguageMetadataRow,
   isSourceLanguageTag,
@@ -1147,6 +1148,16 @@ function analyzeRow(headers, row, rowNumber) {
   };
 }
 
+const KEY_COLUMN_PATTERN = /^(json[-_]?key|key|键|标识)$/i;
+
+function getRowKeyValue(headers, row) {
+  const column = headers.findIndex((header) =>
+    KEY_COLUMN_PATTERN.test(String(normalizeCell(header) ?? "")),
+  );
+  if (column < 0) return "";
+  return normalizeCell(row[column]);
+}
+
 function buildRowContext(headers, row) {
   const preferred = /^(功能版块|功能模块|模块|功能|说明|备注|描述|场景|key|键|标识|文案类型)$/i;
   const entries = headers
@@ -1526,6 +1537,16 @@ async function executeTranslationCommand(
       const languageResults = [];
       let lastSuccessfulTranslation = null;
       for (const job of languageJobs.sort((a, b) => a.rowNumber - b.rowNumber)) {
+        const selfName = getLanguageSelfName(getRowKeyValue(headers, job.row));
+        if (selfName) {
+          languageResults.push({ job, translation: selfName });
+          lastSuccessfulTranslation = {
+            rowNumber: job.rowNumber,
+            sourceText: job.analysis.sourceText,
+            translation: selfName,
+          };
+          continue;
+        }
         const previousRow =
           job.rowNumber - 1 > headerRowNumber
             ? previousRows[job.rowNumber - command.startRow] ?? []
@@ -2560,13 +2581,16 @@ async function executeSingleFullTableTranslation(messageId, taskInput, quiet = f
       .filter((item) => item.tag && !isSourceLanguageTag(item.tag))
       .map((item) => item.value);
     const sourceText = normalizeCell(row[task.sourceColumn]);
+    const rowKey = getRowKeyValue(task.headers, row);
     return {
       rowNumber,
       sourceText,
       rowContext: buildRowContext(task.headers, row),
-      deterministicValue: isLanguageMetadataRow(sourceText, targetValues)
-        ? getLanguageCellValue(task.languageTag, customLanguageRegistry)
-        : "",
+      deterministicValue:
+        getLanguageSelfName(rowKey) ??
+        (isLanguageMetadataRow(sourceText, targetValues)
+          ? getLanguageCellValue(task.languageTag, customLanguageRegistry)
+          : ""),
     };
   });
   const results = await mapWithConcurrency(
