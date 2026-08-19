@@ -123,3 +123,53 @@ export function getLanguageCellValue(languageTag, registry = []) {
   );
   return configured?.sheetValue || languageTag;
 }
+
+// Headers that embed a BCP 47 tag inside parentheses, e.g.
+// `English-(en)`, `English (en)`, `English(语言标签en)`, `简体中文-(zh-Hans)`.
+const TAGGED_HEADER_PATTERN = /\((?:语言标签\s*)?[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*\)/i;
+
+// Infer the dominant style among existing tagged language headers so that a
+// newly added column can follow the same convention:
+// - separator: what sits between the language name and "(", e.g. `-` in
+//   `English-(en)`, ` ` in `English (en)`, or `""` in `English(en)`.
+// - labeled: whether the paren content uses the `语言标签` prefix.
+// Returns null when no tagged header exists (plain-name or suffix style).
+export function inferLanguageHeaderFormatter(headers) {
+  const separatorCounts = new Map();
+  const labeledCounts = new Map();
+  let matched = 0;
+
+  for (const header of headers) {
+    const text = String(header ?? "").trim();
+    if (!TAGGED_HEADER_PATTERN.test(text)) continue;
+    const open = text.indexOf("(");
+    if (open < 0) continue;
+    const before = text.slice(0, open);
+    const separatorMatch = before.match(/([-–—]|\s+)$/);
+    const separator = separatorMatch ? separatorMatch[1] : "";
+    const labeled = /\(语言标签/i.test(text);
+    separatorCounts.set(separator, (separatorCounts.get(separator) ?? 0) + 1);
+    labeledCounts.set(labeled, (labeledCounts.get(labeled) ?? 0) + 1);
+    matched += 1;
+  }
+
+  if (matched === 0) return null;
+  const pickMostCommon = (counts) =>
+    [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  return {
+    separator: pickMostCommon(separatorCounts),
+    labeled: pickMostCommon(labeledCounts),
+  };
+}
+
+// Build a new language header following the inferred style, e.g.
+// `瑞典语-(sv)` for `{ separator: "-", labeled: false }`,
+// `泰语(语言标签th)` for `{ separator: "", labeled: true }`, or just the
+// plain name when no tagged style exists.
+export function buildLanguageHeader(languageName, languageTag, formatter) {
+  const name = String(languageName ?? "").trim();
+  if (!name) return "";
+  if (!formatter) return name;
+  const tag = String(languageTag ?? "").trim();
+  return `${name}${formatter.separator}(${formatter.labeled ? "语言标签" : ""}${tag})`;
+}

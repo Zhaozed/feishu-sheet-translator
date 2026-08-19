@@ -5,8 +5,10 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import {
+  buildLanguageHeader,
   extractLanguageTagFromHeader,
   getLanguageCellValue,
+  inferLanguageHeaderFormatter,
   isLanguageMetadataRow,
   isSourceLanguageTag,
 } from "./lib/language-metadata.js";
@@ -124,6 +126,9 @@ const PLAIN_LANGUAGE_HEADERS = new Map(
     ru: ["Russian", "俄语", "俄語"],
     pt: ["Portuguese", "葡萄牙语", "葡萄牙語"],
     pl: ["Polish", "波兰语", "波蘭語"],
+    sv: ["Swedish", "瑞典语", "瑞典語", "Svenska"],
+    tr: ["Turkish", "土耳其语", "土耳其語", "Türkçe"],
+    th: ["Thai", "泰语", "泰語"],
   }).flatMap(([tag, aliases]) =>
     aliases.map((alias) => [normalizeLanguageHeader(alias), tag]),
   ),
@@ -1659,18 +1664,6 @@ async function executeTranslationCommand(
   return { requiresConfirmation: false, successes, failures };
 }
 
-function inferLanguageHeaderStyle(headers) {
-  const languageHeaders = headers.filter((header) => getLanguageTag(header));
-  const taggedCount = languageHeaders.filter((header) =>
-    /\((?:语言标签\s*)?[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*\)/i.test(
-      normalizeCell(header),
-    ),
-  ).length;
-  return taggedCount > 0 && taggedCount >= languageHeaders.length / 2
-    ? "tagged"
-    : "plain";
-}
-
 async function readRowsInChunks(
   spreadsheetToken,
   sheetId,
@@ -2291,37 +2284,42 @@ async function prepareFullTableTranslation(
     throw new Error("没有找到简体中文源语言列。");
   }
   const normalizedTag = languageTag.toLowerCase();
-  if (
-    headers.some(
-      (header) => getLanguageTag(header)?.toLowerCase() === normalizedTag,
-    )
-  ) {
-    throw new Error(`该工作表已经存在语言标签 ${languageTag}，无需重复添加。`);
-  }
-  if (
-    headers.some(
-      (header) => normalizeLanguageHeader(header) === normalizeLanguageHeader(languageName),
-    )
-  ) {
-    throw new Error(`该工作表已经存在表头“${languageName}”，无需重复添加。`);
+  // A column whose header resolves to the requested language (by tag or by
+  // plain-name alias) may already exist. Reuse that column: empty placeholders
+  // (e.g. manually provisioned `sv` / `tr` / `th`) are filled in place, and
+  // columns that already have translations are re-translated (overwritten).
+  const existingColumnIndex = headers.findIndex((header) => {
+    const tag = getLanguageTag(header);
+    if (!tag) return false;
+    return tag.toLowerCase() === normalizedTag ||
+      normalizeLanguageHeader(header) === normalizeLanguageHeader(languageName);
+  });
+
+  let newColumnIndex = -1;
+  let reusedExistingColumn = false;
+  let retranslateExisting = false;
+  if (existingColumnIndex < 0) {
+    if (
+      headers.some(
+        (header) => normalizeLanguageHeader(header) === normalizeLanguageHeader(languageName),
+      )
+    ) {
+      throw new Error(`该工作表已经存在表头“${languageName}”，无需重复添加。`);
+    }
+    let lastUsedColumn = -1;
+    headers.forEach((header, index) => {
+      if (normalizeCell(header)) {
+        lastUsedColumn = index;
+      }
+    });
+    newColumnIndex = lastUsedColumn + 1;
+    if (newColumnIndex >= 100) {
+      throw new Error("当前表头已到 CV 列，机器人暂时无法继续向右新增语言列。");
+    }
+  } else {
+    newColumnIndex = existingColumnIndex;
   }
 
-  const style = inferLanguageHeaderStyle(headers);
-  const newHeader =
-    style === "tagged"
-      ? `${languageName}(语言标签${languageTag})`
-      : languageName;
-  let lastUsedColumn = -1;
-  headers.forEach((header, index) => {
-    if (normalizeCell(header)) {
-      lastUsedColumn = index;
-    }
-  });
-  const newColumnIndex = lastUsedColumn + 1;
-  if (newColumnIndex >= 100) {
-    throw new Error("当前表头已到 CV 列，机器人暂时无法继续向右新增语言列。");
-  }
-  const column = columnIndexToLetters(newColumnIndex);
   const configuredRowCount =
     sheet.grid_properties?.row_count ?? sheet.row_count ?? 5000;
   const maxRow = Math.min(Math.max(configuredRowCount, headerRowNumber + 1), 20000);
@@ -2344,6 +2342,33 @@ async function prepareFullTableTranslation(
   if (validRowNumbers.length === 0) {
     throw new Error("简体中文列没有任何可翻译内容，无法创建全表翻译任务。");
   }
+  const lastDataRow = validRowNumbers.at(-1);
+
+  if (existingColumnIndex >= 0) {
+    const existingColumnLetters = columnIndexToLetters(existingColumnIndex);
+    const existingValues = await readRowsInChunks(
+      spreadsheetToken,
+      sheetId,
+      headerRowNumber + 1,
+      lastDataRow,
+      existingColumnLetters,
+      existingColumnLetters,
+      500,
+    );
+    const hasContent = existingValues.some((row) => normalizeCell(row[0]));
+    // The column already exists: re-translate it (overwrite) so users can
+    // refresh a whole language column. Empty placeholders are simply filled.
+    retranslateExisting = hasContent;
+    reusedExistingColumn = true;
+  }
+
+  const formatter = inferLanguageHeaderFormatter(headers);
+  const newHeader = reusedExistingColumn
+    ? normalizeCell(headers[newColumnIndex])
+    : formatter
+      ? buildLanguageHeader(languageName, languageTag, formatter)
+      : languageName;
+  const column = columnIndexToLetters(newColumnIndex);
   return {
     spreadsheetCommand,
     spreadsheetToken,
@@ -2352,14 +2377,16 @@ async function prepareFullTableTranslation(
     headerRowNumber,
     headers,
     sourceColumn,
-    style,
+    formatter,
     newHeader,
     newColumnIndex,
     column,
+    reusedExistingColumn,
+    retranslateExisting,
     languageName,
     languageTag,
     validRowNumbers,
-    lastDataRow: validRowNumbers.at(-1),
+    lastDataRow,
   };
 }
 
@@ -2402,7 +2429,13 @@ async function prepareDocumentLocaleTranslation(
     result.skipped ? [result.skipped] : [],
   );
   if (tasks.length === 0) {
-    throw new Error("文档中没有可以新增该语种的 Sheet。");
+    const reasons = Array.from(
+      new Set(skippedSheets.map((item) => item.reason).filter(Boolean)),
+    ).slice(0, 3);
+    const reasonText = reasons.length
+      ? ` 跳过原因：${reasons.join("；")}`
+      : "";
+    throw new Error(`文档中没有可以新增该语种的 Sheet。${reasonText}`);
   }
   return {
     spreadsheetCommand,
@@ -2411,6 +2444,10 @@ async function prepareDocumentLocaleTranslation(
     tasks,
     skippedSheets,
     totalRows: tasks.reduce((sum, task) => sum + task.validRowNumbers.length, 0),
+    retranslateCount: tasks.filter((task) => task.retranslateExisting).length,
+    reusedColumnCount: tasks.filter(
+      (task) => task.reusedExistingColumn && !task.retranslateExisting,
+    ).length,
   };
 }
 
@@ -2434,7 +2471,13 @@ async function showFullTableTranslationPreview(messageId, actorKey, documentTask
         `有效简体中文：**${documentTask.totalRows}行**`,
         `预计翻译并回填：**${documentTask.totalRows}个单元格**`,
         "",
-        "确认后才会调用模型并写入表格；现有语言列不会被修改。",
+        ...(documentTask.retranslateCount > 0
+          ? [`其中 **${documentTask.retranslateCount}个 Sheet** 会重新翻译并覆盖“${documentTask.languageName}（${documentTask.languageTag}）”列的现有译文。`]
+          : []),
+        ...(documentTask.reusedColumnCount > 0
+          ? [`其中 **${documentTask.reusedColumnCount}个 Sheet** 会直接回填已存在的空白语言列，不新增列。`]
+          : []),
+        "除目标语言列外，其他语言列不会被修改。",
         "该确认将在 10 分钟后失效。",
       ].join("\n"),
       {
@@ -2481,13 +2524,18 @@ async function executeSingleFullTableTranslation(messageId, taskInput, quiet = f
     taskInput.languageName,
     taskInput.languageTag,
   );
+  const headerLabel = task.retranslateExisting
+    ? "重新翻译列"
+    : task.reusedExistingColumn
+      ? "回填空白列"
+      : "新增表头";
   if (!quiet) await replyWithCard(
     messageId,
     buildMessageCard(
       "正在执行全表翻译",
       [
         `工作表：${task.sheet.title ?? task.sheetId}`,
-        `新增语言：${task.newHeader}`,
+        `${headerLabel}：${task.newHeader}`,
         `待翻译：${task.validRowNumbers.length}行`,
         "",
         "⏳ 正在读取上下文、生成译文并检查源内容，请稍候……",
@@ -2568,10 +2616,10 @@ async function executeSingleFullTableTranslation(messageId, taskInput, quiet = f
   );
   const failures = results.filter((result) => result.error);
   const valueRanges = [
-    {
+    ...(task.reusedExistingColumn ? [] : [{
       range: `${task.sheetId}!${task.column}${task.headerRowNumber}:${task.column}${task.headerRowNumber}`,
       values: [[task.newHeader]],
-    },
+    }]),
     ...successes.map((result) => ({
       range: `${task.sheetId}!${task.column}${result.job.rowNumber}:${task.column}${result.job.rowNumber}`,
       values: [[result.translation]],
@@ -2584,11 +2632,15 @@ async function executeSingleFullTableTranslation(messageId, taskInput, quiet = f
     messageId,
     buildMessageCard(
       failures.length > 0 || conflicts.size > 0
-        ? "新增语种翻译部分完成"
-        : "新增语种翻译完成",
+        ? task.retranslateExisting
+          ? "整列重新翻译部分完成"
+          : "新增语种翻译部分完成"
+        : task.retranslateExisting
+          ? "整列重新翻译完成"
+          : "新增语种翻译完成",
       [
         `工作表：${task.sheet.title ?? task.sheetId}`,
-        `新增表头：**${task.newHeader}**`,
+        `${headerLabel}：**${task.newHeader}**`,
         `成功回填：${successes.length}行`,
         `翻译失败：${failures.length}行`,
         `源内容变化跳过：${conflicts.size}行`,
@@ -2643,6 +2695,12 @@ async function executeFullTableTranslation(messageId, taskInput) {
         `成功处理 Sheet：${completed}个`,
         `执行失败 Sheet：${failures.length}个`,
         `预检跳过 Sheet：${documentTask.skippedSheets.length}个`,
+        ...(documentTask.retranslateCount > 0
+          ? [`重新翻译并覆盖 Sheet：**${documentTask.retranslateCount}个**`]
+          : []),
+        ...(documentTask.reusedColumnCount > 0
+          ? [`回填已有空白语言列 Sheet：**${documentTask.reusedColumnCount}个**`]
+          : []),
         `计划翻译中文：${documentTask.totalRows}行`,
         "",
         `[打开当前表格](${taskInput.spreadsheetCommand.originalUrl})`,

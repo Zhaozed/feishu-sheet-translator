@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  buildLanguageHeader,
   extractLanguageTagFromHeader,
   getLanguageCellValue,
+  inferLanguageHeaderFormatter,
   isLanguageMetadataRow,
   isSourceLanguageTag,
 } from "../src/lib/language-metadata.js";
@@ -91,4 +93,46 @@ test("简体中文源语言标签识别", () => {
   assert.equal(isSourceLanguageTag("zh-Hant"), false);
   assert.equal(isSourceLanguageTag("ft"), false);
   assert.equal(isSourceLanguageTag("en"), false);
+});
+
+test("裸语言代码表头能被识别", () => {
+  for (const code of ["sv", "tr", "th", "en", "ja"]) {
+    assert.equal(extractLanguageTagFromHeader(code), code, `${code} 应识别为语言列`);
+  }
+});
+
+test("推断现有语言列表头风格", () => {
+  assert.deepEqual(
+    inferLanguageHeaderFormatter(["简体中文-(zh-Hans)", "English-(en)", "French-(fr)"]),
+    { separator: "-", labeled: false },
+  );
+  assert.deepEqual(
+    inferLanguageHeaderFormatter(["简体中文(语言标签zh-Hans)", "English(语言标签en)"]),
+    { separator: "", labeled: true },
+  );
+  assert.deepEqual(
+    inferLanguageHeaderFormatter(["English (en)", "French (fr)"]),
+    { separator: " ", labeled: false },
+  );
+  assert.equal(
+    inferLanguageHeaderFormatter(["简体中文", "English", "title_en"]),
+    null,
+  );
+  assert.equal(inferLanguageHeaderFormatter([]), null);
+});
+
+test("按现有风格构造新语言表头", () => {
+  assert.equal(
+    buildLanguageHeader("瑞典语", "sv", { separator: "-", labeled: false }),
+    "瑞典语-(sv)",
+  );
+  assert.equal(
+    buildLanguageHeader("土耳其语", "tr", { separator: " ", labeled: false }),
+    "土耳其语 (tr)",
+  );
+  assert.equal(
+    buildLanguageHeader("泰语", "th", { separator: "", labeled: true }),
+    "泰语(语言标签th)",
+  );
+  assert.equal(buildLanguageHeader("越南语", "vi", null), "越南语");
 });
